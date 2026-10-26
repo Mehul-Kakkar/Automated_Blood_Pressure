@@ -7,16 +7,16 @@ afterEach(() => {
 })
 
 describe('session commands', () => {
-  it('uses GO to check availability and reports the unsupported real device', async () => {
+  it('uses Start to check availability and reports the unsupported real device', async () => {
     useAppStore.getState().setDemo(false)
-    expect(await useAppStore.getState().go()).toBe(false)
+    expect(await useAppStore.getState().startFromHome()).toBe(false)
     expect(useAppStore.getState().state).toBe('disconnected')
     expect(useAppStore.getState().error).toContain('No compatible device found')
   })
 
-  it('uses GO to connect the demo device and start only after acknowledgement', async () => {
+  it('uses Start to connect the demo device and start only after acknowledgement', async () => {
     useAppStore.getState().setDemo(true)
-    expect(await useAppStore.getState().go()).toBe(true)
+    expect(await useAppStore.getState().startFromHome()).toBe(true)
     expect(useAppStore.getState().state).toBe('measuring')
     await useAppStore.getState().stop()
   })

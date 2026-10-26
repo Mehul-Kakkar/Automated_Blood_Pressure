@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { DemoDevice, type Session, type SessionState, type Telemetry } from './domain'
 
-type Store = { demo: boolean; connected: boolean; state: SessionState; samples: Telemetry[]; sessions: Session[]; startedAt?: number; busy: boolean; error?: string; connect: () => Promise<void>; go: () => Promise<boolean>; start: () => Promise<void>; stop: () => Promise<void>; resetSession: () => void; addSample: (sample: Telemetry) => void; clearError: () => void; setDemo: (value: boolean) => void; simulateDisconnect: () => void; simulateFault: () => void }
+type Store = { demo: boolean; connected: boolean; state: SessionState; samples: Telemetry[]; sessions: Session[]; startedAt?: number; busy: boolean; error?: string; connect: () => Promise<void>; startFromHome: () => Promise<boolean>; start: () => Promise<void>; stop: () => Promise<void>; resetSession: () => void; addSample: (sample: Telemetry) => void; clearError: () => void; setDemo: (value: boolean) => void; simulateDisconnect: () => void; simulateFault: () => void }
 const demoDevice = new DemoDevice()
 const initialDemo = import.meta.env.DEV && import.meta.env.VITE_DEMO_MODE === 'true'
 let unsubscribeDemo: (() => void) | undefined
@@ -19,7 +19,7 @@ export const useAppStore = create<Store>((set, get) => ({
     try { await demoDevice.connect(); const status = await demoDevice.reconcile(); set({ busy: false, connected: true, state: status === 'measuring' ? 'measuring' : status==='fault'?'device_fault':'connected_idle' }) }
     catch (e) { set({ busy: false, state: 'error', error: e instanceof Error ? e.message : 'Could not connect to the demo device.' }) }
   },
-  go: async () => {
+  startFromHome: async () => {
     const current=get(); if(current.busy || current.state==='measuring' || current.state==='stopping') return false
     set({ busy:true, error:undefined, state:'connecting' })
     if (!current.demo) {
