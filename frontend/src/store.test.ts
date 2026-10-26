@@ -7,11 +7,12 @@ afterEach(() => {
 })
 
 describe('session commands', () => {
-  it('uses Start to check availability and reports the unsupported real device', async () => {
+  it('fails clearly when the real backend is not configured and does not fall back to demo', async () => {
     useAppStore.getState().setDemo(false)
+    useAppStore.getState().setApiToken('fixture-owner-token')
     expect(await useAppStore.getState().startFromHome()).toBe(false)
-    expect(useAppStore.getState().state).toBe('disconnected')
-    expect(useAppStore.getState().error).toContain('No compatible device found')
+    expect(useAppStore.getState().state).toBe('error')
+    expect(useAppStore.getState().error).toContain('Backend is unavailable')
   })
 
   it('uses Start to connect the demo device and start only after acknowledgement', async () => {

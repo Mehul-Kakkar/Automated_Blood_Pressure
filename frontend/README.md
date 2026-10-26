@@ -1,65 +1,45 @@
 # Device companion frontend
 
-A mobile-first companion UI for an experimental ESP32 signal-monitoring prototype. The opening screen has one primary Start action: it checks for the device, starts only after the device is available, and reports a connection error when no supported device can be found. In demo mode the same action connects to the simulator and starts a labeled demo session. The live session replaces the start surface in place, keeping the flow on Home without a separate Measure tab. This application is not a clinically validated blood-pressure monitor.
+Mobile-first React + TypeScript application for the experimental ESP32 signal-monitoring project. React Router preserves the existing page structure, Zustand holds in-memory application state, and Zod validates frontend and backend payloads. The UI is experimental and not clinically validated.
 
-## Requirements and setup
+## Setup
 
-- Node.js 20 or newer
-- npm 10 or newer
+Requirements: Node.js 20+ and npm 10+.
 
-```sh
+```powershell
+Set-Location .\frontend
 npm install
+Copy-Item .env.example .env.local
+# Set VITE_API_BASE_URL in .env.local to http://127.0.0.1:8000 for a local backend.
 npm run dev
 ```
 
-The app is a React + TypeScript single-page application built with Vite. React Router handles navigation; Zustand owns the in-memory session state; Zod validates telemetry; Lucide supplies interface icons. Tailwind CSS is configured, with the interface's design tokens and responsive styles currently authored in `src/styles.css`.
+`VITE_API_BASE_URL` is the base URL for the typed `src/api.ts` client. `VITE_DEMO_MODE=true` starts the explicit development simulator on local development builds. All `VITE_` variables are public; never put owner tokens or broker credentials in them.
 
-## Environment
+## Backend/API integration
 
-Copy `.env.example` to `.env.local` if configuration is needed.
+The client validates health/readiness, owner-scoped device registration/status, sessions/history, sample/event pages, reports, and PDF downloads. Owner access uses the backend-issued bearer token entered on Settings; it is kept in memory for the current page session only. Refreshing the page clears it. Backend CORS must allow the exact frontend origin, normally `http://localhost:5173`.
 
-| Variable | Purpose |
-| --- | --- |
-| `VITE_API_BASE_URL` | Reserved backend API base URL. No backend API contract was present in the repository. |
-| `VITE_DEMO_MODE` | Set to `true` in development to enable the demo adapter on launch. It defaults off. Demo mode can also be explicitly enabled in Settings. |
-
-All `VITE_` values are public. Do not put credentials or secrets in them. No API calls are currently made and demo data is never uploaded.
+- Registering a device creates only an owner-scoped database record. It does not enroll MQTT credentials, provision the hardware, or make the device online.
+- The session Start button requires a selected device with fresh `online` and `idle` status. It uses an idempotency key and waits for the backend session to reach device-confirmed `measuring` before showing the active state.
+- Stop displays a stopping state and waits for device-confirmed completion. Lost or late confirmation is shown as uncertain; a successful HTTP response alone is never treated as hardware stop.
+- Live updates use the authenticated session SSE endpoint. Batch events cause bounded sample-page retrieval; graph buffers are capped at 120 records and rendering follows incoming batches. Missing values stay unavailable. Telemetry is marked stale after 15 seconds without a server-received sample; this is a frontend freshness indicator, not a device safety threshold.
+- History is owner-scoped, paginated, and filters records marked demo/synthetic. PDF generation shows the report's status and stored limitations.
 
 ## Demo mode
 
-Enable **Development demo mode** in Settings or set `VITE_DEMO_MODE=true` while running `npm run dev`. A persistent DEMO MODE banner indicates simulated data. Press Start to connect the demo adapter and begin; Stop remains explicit on the in-place session view. Settings also includes demo-only fault and connection-loss scenarios for recovery-state review. The demo adapter generates only low-rate acoustic-envelope samples; it never invents heart rate, cuff pressure, or systolic/diastolic values. Session history currently lives in memory and clears on page reload. Demo content cannot be sent to a backend.
+Enable **Development demo mode** in Settings or set `VITE_DEMO_MODE=true` on a local dev build. The banner labels all generated samples. Demo sessions remain in memory, never use the backend API, and never mix with server sessions. Demo signals are low-rate envelope samples only; they do not fabricate pressure, heart rate, event markers, or clinical results. There is no automatic fallback to demo if an API/device call fails.
 
-## Real device integration
+## Real ESP32 limitations
 
-Real device communication is intentionally unavailable. In production mode, Start shows a connection-check loading state and then reports that no compatible device can be found because the inspected firmware does not advertise a supported BLE service. The firmware in `../ESP Code Main/korotkoffDebug/korotkoffDebug.ino` streams a seven-column diagnostic CSV over USB Serial. It samples a microphone, applies digital filters, and reports an acoustic detector envelope and event flag. It does not expose BLE, a pressure sensor, heart-rate telemetry, a session state API, or Start/Stop commands. Reference UUIDs and binary packet layouts from the original brief were not present in firmware and have not been implemented.
+The inspected `ESP Code Main/korotkoffDebug/korotkoffDebug.ino` produces USB Serial CSV (`ms,raw,filtered,envelope,noise,threshold,event`) at 460800 baud. It has no Wi-Fi/MQTT, BLE, device identity, pressure sensor/conversion, heart-rate source, network session state, or Start/Stop acknowledgement. `korotkoffTest` is a separate serial detector test. The backend's versioned MQTT envelope is a proposed future contract and these sketches do not implement it. Consequently, device registration in the UI cannot make the current firmware online and real remote Start/Stop/live pressure is not yet available.
 
-`src/domain.ts` defines the adapter interface and a bounds-checked parser for the observed CSV fields. The application does not connect that parser to a serial port and does not transmit commands. Before enabling a real adapter, establish and verify a versioned protocol with acknowledgement semantics, authoritative running/stopped state, telemetry units/validity, timeout/reconnect behavior, and device identity. Keep all pump and valve GPIO control out of the frontend. Firmware owns hardware safety, shutdown, pressure release, timeouts, and watchdog behavior.
-
-Browser Web Bluetooth support varies by browser and platform; iOS Safari does not provide the same Web Bluetooth API as Chromium desktop/Android. A future Capacitor build will require a native BLE plugin/adapter and platform permission handling. Keep device services behind `DeviceAdapter` so transport changes do not alter session UI logic.
-
-## Backend integration
-
-No backend API files or schemas were present. `VITE_API_BASE_URL` is reserved for a future typed client. Define endpoints and idempotency semantics before implementing Start/Stop or session synchronization. A backend outage must not be used as proof that a device has stopped. Do not cache sensitive API responses or upload demo sessions.
-
-## PWA and deployment
-
-The Vite PWA plugin emits an installable manifest and a service worker that precaches static app assets only. It does not cache API responses or health data. Offline app shell availability does not imply device or backend connectivity. Updates use the plugin's prompt strategy; the service worker update UX should be connected before production rollout.
-
-For Vercel, set the project root directory to `frontend/`, use `npm install` and `npm run build`, and publish `dist`. `vercel.json` rewrites client routes to the app entry point. Set `VITE_API_BASE_URL` only when a real API is implemented; never put secrets in Vite variables.
+The UI shows discrete stored envelope/pressure points and exact-timestamp event markers only. It does not reconstruct audio-rate waveforms, infer pressure from detector events, or display systolic/diastolic estimates. Pressure appears only when the backend provides a valid mmHg sample carrying confirmed calibration metadata. No report is clinically validated.
 
 ## Checks
 
-```sh
+```powershell
 npm run typecheck
 npm test
 npm run build
 ```
-
-## Known limitations
-
-- Firmware currently supports USB Serial acoustic debug output only. BLE and safe session-control protocol are missing.
-- Pressure, heart rate, live waveform, clinical summaries, and validated blood-pressure results are not available.
-- Backend integration, account handling, durable session storage/sync, and authentication are not implemented.
-- Demo history is memory-only and disappears on reload.
-- No native Capacitor build is included. A native BLE adapter and permissions will be needed later.
-- This experimental prototype is not for diagnosis or treatment decisions.
