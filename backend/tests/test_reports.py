@@ -9,15 +9,15 @@ from sqlalchemy.orm import sessionmaker
 from app.db.session import get_db_session
 from app.models import (AcousticEvent, Device, MeasurementSession, Owner, SessionEvent,
                         TelemetryBatch, TelemetrySample)
-from app.security.auth import get_current_owner_id
+from app.security.auth import get_current_owner_username
 from app.services.reports import ReportService, build_report_data, generate_pdf
 
 
 def make_session(db_session, *, completed: bool = False):
-    owner = Owner(display_name="synthetic report test owner")
+    owner = Owner(username="synthetic_report_test_owner", display_name="synthetic report test owner")
     db_session.add(owner)
     db_session.flush()
-    device = Device(owner_id=owner.id, device_identifier=f"synthetic-{uuid4()}", firmware_version="fixture-fw",
+    device = Device(owner_username=owner.username, device_identifier=f"synthetic-{uuid4()}", firmware_version="fixture-fw",
                     processing_algorithm_version="fixture-algo")
     db_session.add(device)
     db_session.flush()
@@ -65,7 +65,7 @@ def test_incomplete_session_and_invalid_sample_are_explicit(db_session) -> None:
 def test_report_pdf_contains_a_valid_paginated_pdf_and_graph() -> None:
     """Synthetic empty report fixture exercises empty chart and PDF generation."""
     from app.models import Report
-    owner = Owner(display_name="synthetic pdf owner")
+    owner = Owner(username="synthetic_pdf_owner", display_name="synthetic pdf owner")
     device = Device(device_identifier="synthetic-pdf-device")
     session = MeasurementSession(device_id=uuid4(), lifecycle="created", data_provenance="synthetic_test")
     report = Report(id=uuid4(), session_id=session.id, report_version="v1", generator_version="test")
@@ -82,7 +82,7 @@ def test_report_endpoints_are_owner_scoped_and_idempotent(client: TestClient, db
         with factory() as request_db:
             yield request_db
     client.app.dependency_overrides[get_db_session] = override_db
-    client.app.dependency_overrides[get_current_owner_id] = lambda: owner.id
+    client.app.dependency_overrides[get_current_owner_username] = lambda: owner.username
     path = f"/api/v1/sessions/{session.id}/report"
     first = client.post(path)
     assert first.status_code == 201, first.text
@@ -93,7 +93,7 @@ def test_report_endpoints_are_owner_scoped_and_idempotent(client: TestClient, db
     pdf_response = client.get(f"{path}.pdf")
     assert pdf_response.status_code == 200
     assert pdf_response.content.startswith(b"%PDF-")
-    client.app.dependency_overrides[get_current_owner_id] = lambda: uuid4()
+    client.app.dependency_overrides[get_current_owner_username] = lambda: "another_owner"
     assert client.get(path).status_code == 404
 
 

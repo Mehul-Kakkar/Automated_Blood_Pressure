@@ -2,7 +2,6 @@
 
 import hashlib
 from typing import Annotated
-from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -15,10 +14,10 @@ from app.models import OwnerCredential
 bearer_scheme = HTTPBearer(auto_error=False, scheme_name="OwnerBearer")
 
 
-def get_current_owner_id(
+def get_current_owner_username(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     db: Annotated[Session, Depends(get_db_session)],
-) -> UUID:
+) -> str:
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer authentication is required.")
     if not credentials.credentials or len(credentials.credentials) > 256:
@@ -32,4 +31,4 @@ def get_current_owner_id(
     )
     if credential is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer credential.")
-    return credential.owner_id
+    return credential.owner_username

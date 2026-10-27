@@ -174,25 +174,36 @@ Live TLS/broker validation requires an operator-provisioned broker, database, ba
 
 ## Phase 5: sessions, owner authorization, samples, and live events
 
-All session endpoints require `Authorization: Bearer <owner-token>`. Tokens are high-entropy random values; only a SHA-256 digest is stored. Create an owner and token after applying migrations:
+All account-scoped endpoints require `Authorization: Bearer <owner-token>`. Tokens are high-entropy random values; only a SHA-256 digest is stored. `owners.username` is the unique primary key, and `display_name` is an independent editable profile value. Create an account and token after applying migrations:
 
 ```powershell
-python -m app.cli create-owner "Local device owner"
+python -m app.cli create-owner device_owner "Local Device Owner"
 ```
 
 The command prints the token once; place it in a local secret manager or a protected environment variable. Rotate and revoke that owner's active credentials by issuing:
 
 ```powershell
-python -m app.cli rotate-credential OWNER_UUID_FROM_CREATE_OUTPUT
+python -m app.cli rotate-credential device_owner
 ```
 
 Devices must be associated with the owner through a trusted enrollment/admin process. The authenticated device registration endpoint creates an MQTT-disabled owner record only; broker enrollment and credential provisioning remain operator-controlled. For a local test only, update an already registered device in `psql` after replacing placeholders:
 
 ```sql
 UPDATE devices
-SET owner_id = '<OWNER_UUID>'
+SET owner_username = 'device_owner'
 WHERE id = '<DEVICE_UUID>';
 ```
+
+Existing UUID-keyed owners are migrated to deterministic usernames `user_<32 lowercase UUID hex characters>`. Their original UUID is preserved in `legacy_id`, and existing credentials and device ownership are migrated to `owner_username`. Run `alembic upgrade head` before starting the updated service. Username is immutable through the profile API.
+
+Authenticated profile operations:
+
+- `GET /api/v1/profile` — username, display name, and avatar availability.
+- `PUT /api/v1/profile` — update `display_name` without changing the account username.
+- `PUT /api/v1/profile/avatar` — persist a PNG/JPEG/WebP/GIF image (up to 1 MiB).
+- `GET /api/v1/profile/avatar` and `DELETE /api/v1/profile/avatar` — retrieve or remove that image.
+
+The frontend User profile uses these authenticated endpoints. Image bytes currently reside in the owner row; the schema can be migrated to external object storage later. Stored sessions and report snapshots are owned transitively through the registered device. Report snapshots persist supported calculations and generation/version metadata; at present valid heart-rate min/max/mean may be calculated, while no systolic/diastolic estimator exists.
 
 Do not set `pressure_calibration_confirmed` or a calibration version unless that device's conversion and units have actually been confirmed. MQTT pressure batches are rejected until both are set. The existing firmware has no pressure sensor or calibration and cannot produce this data.
 

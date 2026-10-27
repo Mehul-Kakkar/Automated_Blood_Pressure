@@ -20,11 +20,11 @@ def utc(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
-def owned_session(db: Session, owner_id: UUID, session_id: UUID) -> tuple[MeasurementSession, Device] | None:
+def owned_session(db: Session, owner_username: str, session_id: UUID) -> tuple[MeasurementSession, Device] | None:
     row = db.execute(
         select(MeasurementSession, Device)
         .join(Device, Device.id == MeasurementSession.device_id)
-        .where(MeasurementSession.id == session_id, Device.owner_id == owner_id)
+        .where(MeasurementSession.id == session_id, Device.owner_username == owner_username)
     ).first()
     return (row[0], row[1]) if row else None
 

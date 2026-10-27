@@ -13,7 +13,7 @@ from app.db.base import Base
 class Device(Base):
     __tablename__ = "devices"
     __table_args__ = (
-        Index("ix_devices_owner_id", "owner_id"),
+        Index("ix_devices_owner_username", "owner_username"),
         CheckConstraint(
             "pressure_calibration_confirmed = false OR pressure_calibration_version IS NOT NULL",
             name="pressure_calibration_requires_version",
@@ -21,7 +21,7 @@ class Device(Base):
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
-    owner_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("owners.id", ondelete="SET NULL"))
+    owner_username: Mapped[str | None] = mapped_column(String(48), ForeignKey("owners.username", ondelete="SET NULL"))
     device_identifier: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     hardware_revision: Mapped[str | None] = mapped_column(String(64))
     firmware_version: Mapped[str | None] = mapped_column(String(64))

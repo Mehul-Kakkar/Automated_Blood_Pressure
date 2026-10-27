@@ -40,4 +40,14 @@ describe('typed backend API client', () => {
   expect(page).toMatchObject({limit:10,offset:20,total:45})
   expect(seenUrl).toContain('/api/v1/sessions?limit=10&offset=20')
  })
+ it('reads and updates username and display name as separate profile fields', async () => {
+  const profile={username:'device_owner',display_name:'Local Owner',created_at:'2026-01-01T00:00:00Z',avatar_available:false}
+  const seen:RequestInit[]=[]
+  const api=new BackendApi('http://api.test',async(_url,init)=>{seen.push(init??{});return response({...profile,...(init?.method==='PUT'?{display_name:'Updated Name'}:{})})})
+  api.setToken('profile-owner-token')
+  expect(await api.getProfile()).toMatchObject({username:'device_owner',display_name:'Local Owner'})
+  expect(await api.updateProfile('Updated Name')).toMatchObject({username:'device_owner',display_name:'Updated Name'})
+  expect(new Headers(seen[1].headers).get('Authorization')).toBe('Bearer profile-owner-token')
+  expect(JSON.parse(String(seen[1].body))).toEqual({display_name:'Updated Name'})
+ })
 })

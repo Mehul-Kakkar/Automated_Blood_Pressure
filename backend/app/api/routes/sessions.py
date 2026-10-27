@@ -31,17 +31,17 @@ from app.schemas.sessions import (
     SessionSamplesPage,
     TelemetrySampleResponse,
 )
-from app.security.auth import get_current_owner_id
+from app.security.auth import get_current_owner_username
 from app.services.session_lifecycle import build_session_response, make_command, owned_session, record_session_event, utc
 
 logger = logging.getLogger("api.sessions")
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 Db = Annotated[Session, Depends(get_db_session)]
-OwnerId = Annotated[UUID, Depends(get_current_owner_id)]
+OwnerUsername = Annotated[str, Depends(get_current_owner_username)]
 
 
-def _require_owned_device(db: Session, owner_id: UUID, device_id: UUID) -> Device:
-    device = db.scalar(select(Device).where(Device.id == device_id, Device.owner_id == owner_id))
+def _require_owned_device(db: Session, owner_username: str, device_id: UUID) -> Device:
+    device = db.scalar(select(Device).where(Device.id == device_id, Device.owner_username == owner_username))
     if device is None:
         raise HTTPException(status_code=404, detail="Device was not found.")
     return device
@@ -73,10 +73,10 @@ def create_session(
     request: Request,
     response: Response,
     db: Db,
-    owner_id: OwnerId,
+    owner_username: OwnerUsername,
 ) -> SessionResponse:
     settings: Settings = request.app.state.settings
-    device = _require_owned_device(db, owner_id, body.device_id)
+    device = _require_owned_device(db, owner_username, body.device_id)
     existing = db.scalar(
         select(MeasurementSession).where(
             MeasurementSession.device_id == device.id,
@@ -123,7 +123,7 @@ def create_session(
     try:
         service = _require_messaging(request)
         command = make_command(device.id, session.id, DeviceCommandType.START, settings.mqtt_command_ttl_seconds)
-        service.publish_command(command, owner_id=owner_id)
+        service.publish_command(command, owner_username=owner_username)
     except MessagingError as exc:
         db.refresh(session)
         if session.lifecycle == "created":
@@ -149,11 +149,11 @@ def create_session(
 def list_sessions(
     request: Request,
     db: Db,
-    owner_id: OwnerId,
+    owner_username: OwnerUsername,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
 ) -> SessionPage:
-    filters = Device.owner_id == owner_id
+    filters = Device.owner_username == owner_username
     total = db.scalar(
         select(func.count()).select_from(MeasurementSession).join(Device).where(filters)
     ) or 0
@@ -170,8 +170,8 @@ def list_sessions(
 
 
 @router.get("/{session_id}", response_model=SessionResponse)
-def get_session(session_id: UUID, request: Request, db: Db, owner_id: OwnerId) -> SessionResponse:
-    result = owned_session(db, owner_id, session_id)
+def get_session(session_id: UUID, request: Request, db: Db, owner_username: OwnerUsername) -> SessionResponse:
+    result = owned_session(db, owner_username, session_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Session was not found.")
     return _view(db, result[0], result[1], request.app.state.settings)
@@ -179,9 +179,9 @@ def get_session(session_id: UUID, request: Request, db: Db, owner_id: OwnerId) -
 
 @router.post("/{session_id}/complete", response_model=SessionResponse, status_code=status.HTTP_202_ACCEPTED)
 def request_session_completion(
-    session_id: UUID, request: Request, response: Response, db: Db, owner_id: OwnerId
+    session_id: UUID, request: Request, response: Response, db: Db, owner_username: OwnerUsername
 ) -> SessionResponse:
-    result = owned_session(db, owner_id, session_id)
+    result = owned_session(db, owner_username, session_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Session was not found.")
     session, device = result
@@ -197,7 +197,7 @@ def request_session_completion(
     try:
         service.publish_command(
             make_command(device.id, session.id, DeviceCommandType.STOP, request.app.state.settings.mqtt_command_ttl_seconds),
-            owner_id=owner_id,
+            owner_username=owner_username,
         )
     except MessagingError as exc:
         logger.info("session_stop_command_failed", extra={"event": "session_stop_command_failed"})
@@ -207,8 +207,8 @@ def request_session_completion(
 
 
 @router.post("/{session_id}/cancel", response_model=SessionResponse)
-def cancel_session(session_id: UUID, request: Request, db: Db, owner_id: OwnerId) -> SessionResponse:
-    result = owned_session(db, owner_id, session_id)
+def cancel_session(session_id: UUID, request: Request, db: Db, owner_username: OwnerUsername) -> SessionResponse:
+    result = owned_session(db, owner_username, session_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Session was not found.")
     session, device = result
@@ -237,11 +237,11 @@ def cancel_session(session_id: UUID, request: Request, db: Db, owner_id: OwnerId
 def get_session_samples(
     session_id: UUID,
     db: Db,
-    owner_id: OwnerId,
+    owner_username: OwnerUsername,
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
     offset: Annotated[int, Query(ge=0, le=1_000_000)] = 0,
 ) -> SessionSamplesPage:
-    if owned_session(db, owner_id, session_id) is None:
+    if owned_session(db, owner_username, session_id) is None:
         raise HTTPException(status_code=404, detail="Session was not found.")
     sample_count = db.scalar(select(func.count()).select_from(TelemetrySample).where(TelemetrySample.session_id == session_id)) or 0
     event_count = db.scalar(select(func.count()).select_from(AcousticEvent).where(AcousticEvent.session_id == session_id)) or 0
@@ -289,11 +289,11 @@ def _event_response(event: SessionEvent) -> SessionEventResponse:
 
 @router.get("/{session_id}/events", response_model=SessionEventsPage)
 def get_session_events(
-    session_id: UUID, db: Db, owner_id: OwnerId,
+    session_id: UUID, db: Db, owner_username: OwnerUsername,
     after_id: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=200)] = 100,
 ) -> SessionEventsPage:
-    if owned_session(db, owner_id, session_id) is None:
+    if owned_session(db, owner_username, session_id) is None:
         raise HTTPException(status_code=404, detail="Session was not found.")
     rows = db.scalars(
         select(SessionEvent).where(SessionEvent.session_id == session_id, SessionEvent.id > after_id)
@@ -311,12 +311,12 @@ async def stream_session_events(
     session_id: UUID,
     request: Request,
     db: Db,
-    owner_id: OwnerId,
+    owner_username: OwnerUsername,
     last_event_id: Annotated[int | None, Header(alias="Last-Event-ID")] = None,
     after_id: Annotated[int, Query(ge=0)] = 0,
     max_events: Annotated[int | None, Query(ge=1, le=1000)] = None,
 ) -> StreamingResponse:
-    if owned_session(db, owner_id, session_id) is None:
+    if owned_session(db, owner_username, session_id) is None:
         raise HTTPException(status_code=404, detail="Session was not found.")
     cursor = max(after_id, last_event_id or 0)
 

@@ -9,11 +9,11 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db_session
 from app.models import Device
 from app.schemas.devices import DeviceListResponse, DeviceRegistrationRequest, DeviceResponse
-from app.security.auth import get_current_owner_id
+from app.security.auth import get_current_owner_username
 
 router = APIRouter(prefix="/api/v1/devices", tags=["devices"])
 Db = Annotated[Session, Depends(get_db_session)]
-OwnerId = Annotated[UUID, Depends(get_current_owner_id)]
+OwnerUsername = Annotated[str, Depends(get_current_owner_username)]
 
 def _view(device: Device, max_age: int) -> DeviceResponse:
     seen = device.state_reported_at
@@ -29,8 +29,8 @@ def _view(device: Device, max_age: int) -> DeviceResponse:
         pressure_calibration_version=device.pressure_calibration_version)
 
 @router.post("", response_model=DeviceResponse, status_code=status.HTTP_201_CREATED)
-def register_device(body: DeviceRegistrationRequest, request: Request, db: Db, owner_id: OwnerId) -> DeviceResponse:
-    device = Device(owner_id=owner_id, device_identifier=body.device_identifier,
+def register_device(body: DeviceRegistrationRequest, request: Request, db: Db, owner_username: OwnerUsername) -> DeviceResponse:
+    device = Device(owner_username=owner_username, device_identifier=body.device_identifier,
                     hardware_revision=body.hardware_revision, mqtt_enabled=False)
     db.add(device)
     try:
@@ -42,14 +42,14 @@ def register_device(body: DeviceRegistrationRequest, request: Request, db: Db, o
     return _view(device, request.app.state.settings.device_state_max_age_seconds)
 
 @router.get("", response_model=DeviceListResponse)
-def list_devices(request: Request, db: Db, owner_id: OwnerId) -> DeviceListResponse:
-    devices = db.scalars(select(Device).where(Device.owner_id == owner_id).order_by(Device.registered_at.desc())).all()
+def list_devices(request: Request, db: Db, owner_username: OwnerUsername) -> DeviceListResponse:
+    devices = db.scalars(select(Device).where(Device.owner_username == owner_username).order_by(Device.registered_at.desc())).all()
     max_age = request.app.state.settings.device_state_max_age_seconds
     return DeviceListResponse(items=[_view(device, max_age) for device in devices])
 
 @router.get("/{device_id}", response_model=DeviceResponse)
-def get_device(device_id: UUID, request: Request, db: Db, owner_id: OwnerId) -> DeviceResponse:
-    device = db.scalar(select(Device).where(Device.id == device_id, Device.owner_id == owner_id))
+def get_device(device_id: UUID, request: Request, db: Db, owner_username: OwnerUsername) -> DeviceResponse:
+    device = db.scalar(select(Device).where(Device.id == device_id, Device.owner_username == owner_username))
     if device is None:
         raise HTTPException(status_code=404, detail="Device was not found.")
     return _view(device, request.app.state.settings.device_state_max_age_seconds)

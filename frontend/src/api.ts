@@ -32,6 +32,7 @@ const SamplesSchema = z.object({
 const ReportSchema = z.object({ id: z.string().uuid(), session_id: z.string().uuid(), report_version: z.string(), generator_version: z.string(),
   status: z.string(), validation_status: z.string().nullable(), sample_count: z.number().nullable(), content_sha256: z.string().nullable(),
   generated_at: z.string().nullable(), report: z.record(z.string(), z.unknown()).nullable().optional() })
+const ProfileSchema = z.object({ username: z.string(), display_name: z.string(), created_at: z.string(), avatar_available: z.boolean() })
 const ApiErrorSchema = z.object({ error: z.object({ code: z.string(), message: z.string(), details: z.array(z.unknown()).optional() }) })
 
 export type Device = z.infer<typeof DeviceSchema>
@@ -41,6 +42,7 @@ export type RemoteAcousticEvent = z.infer<typeof SamplesSchema>['acoustic_events
 export type SamplesPage = z.infer<typeof SamplesSchema>
 export type SessionPage = z.infer<typeof SessionPageSchema>
 export type Report = z.infer<typeof ReportSchema>
+export type Profile = z.infer<typeof ProfileSchema>
 export type SessionEvent = { id?: number; event_id?: string; session_id?: string | null; event_type: string; data?: Record<string, unknown> }
 export type ApiFailureKind = 'configuration' | 'timeout' | 'authorization' | 'validation' | 'server' | 'network' | 'response'
 export class ApiError extends Error { constructor(message: string, readonly kind: ApiFailureKind, readonly status?: number) { super(message); this.name = 'ApiError' } }
@@ -99,6 +101,18 @@ export class BackendApi {
   async generateReport(id: string) { return this.json(`/api/v1/sessions/${encodeURIComponent(id)}/report`, ReportSchema, { method: 'POST' }) }
   async getReport(id: string) { return this.json(`/api/v1/sessions/${encodeURIComponent(id)}/report`, ReportSchema) }
   async downloadReport(id: string): Promise<Blob> { return (await this.request(`/api/v1/sessions/${encodeURIComponent(id)}/report.pdf`, { headers: { Accept: 'application/pdf' } })).blob() }
+  async getProfile() { return this.json('/api/v1/profile', ProfileSchema) }
+  async updateProfile(displayName: string) { return this.json('/api/v1/profile', ProfileSchema, { method: 'PUT', body: JSON.stringify({ display_name: displayName }) }) }
+  async uploadAvatar(file: File) {
+    if (file.size > 1_048_576) throw new ApiError('Profile image must be no larger than 1 MiB.', 'validation')
+    if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type)) throw new ApiError('Choose a PNG, JPEG, WebP or GIF image.', 'validation')
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    let binary = ''
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
+    return this.json('/api/v1/profile/avatar', ProfileSchema, { method: 'PUT', body: JSON.stringify({ content_type: file.type, data_base64: btoa(binary) }) })
+  }
+  async downloadAvatar(): Promise<Blob> { return (await this.request('/api/v1/profile/avatar', { headers: { Accept: 'image/*' } })).blob() }
+  async deleteAvatar() { return this.json('/api/v1/profile/avatar', ProfileSchema, { method: 'DELETE' }) }
 
   async streamSessionEvents(id: string, onEvent: (event: SessionEvent) => void, signal: AbortSignal, afterId = 0): Promise<void> {
     const response = await this.request(`/api/v1/sessions/${encodeURIComponent(id)}/events/stream?after_id=${afterId}`, { signal, headers: { Accept: 'text/event-stream' } }, null)

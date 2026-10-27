@@ -584,10 +584,10 @@ class MessagingService:
         if expired_response:
             raise MessageRejected("Command response arrived after expiry.")
 
-    def publish_command(self, command: DeviceCommandRequest, *, owner_id: UUID | None = None) -> DeviceCommand:
+    def publish_command(self, command: DeviceCommandRequest, *, owner_username: str | None = None) -> DeviceCommand:
         if not self._enabled or self._client is None or not self._client.is_connected():
             raise BrokerUnavailable("MQTT broker is not connected; command was not queued.")
-        if owner_id is None and not self.command_authorizer.authorize(command):
+        if owner_username is None and not self.command_authorizer.authorize(command):
             raise CommandNotAuthorized("Command was not authorized by the configured policy.")
         if self.session_factory is None:
             raise RuntimeError("Database is unavailable.")
@@ -604,7 +604,7 @@ class MessagingService:
                 if existing is not None:
                     raise DuplicateCommandId("Command ID has already been used.")
                 device = self._require_enrolled_device(db, command.device_id, command.device_id)
-                if owner_id is not None and device.owner_id != owner_id:
+                if owner_username is not None and device.owner_username != owner_username:
                     raise CommandNotAuthorized("Device is not owned by the authenticated API owner.")
                 if command.session_id is not None:
                     measurement_session = db.get(MeasurementSession, command.session_id)

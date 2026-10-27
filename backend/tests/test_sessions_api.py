@@ -9,17 +9,17 @@ from sqlalchemy.orm import sessionmaker
 from app.db.session import get_db_session
 from app.messaging.schemas import DeviceCommandType
 from app.models import Device, DeviceCommand, MeasurementSession, Owner, OwnerCredential, SessionEvent, TelemetrySample
-from app.security.auth import get_current_owner_id
+from app.security.auth import get_current_owner_username
 from tests.test_messaging import FakeTransport, make_service, mqtt_settings
 from tests.test_persistence import make_payload
 
 
 def setup_owned_device(client: TestClient, db_session):
-    owner = Owner(display_name="test owner")
+    owner = Owner(username="test_owner", display_name="test owner")
     db_session.add(owner)
     db_session.flush()
     device = Device(
-        owner_id=owner.id,
+        owner_username=owner.username,
         device_identifier=f"api-device-{uuid4()}",
         mqtt_enabled=True,
         reported_state="idle",
@@ -36,7 +36,7 @@ def setup_owned_device(client: TestClient, db_session):
         with factory() as request_db:
             yield request_db
     client.app.dependency_overrides[get_db_session] = override_db
-    client.app.dependency_overrides[get_current_owner_id] = lambda: owner.id
+    client.app.dependency_overrides[get_current_owner_username] = lambda: owner.username
     service = make_service(db_session)[0]
     transport = service._client
     transport.connect_callback()
@@ -45,11 +45,11 @@ def setup_owned_device(client: TestClient, db_session):
 
 
 def test_sessions_require_owner_bearer_authentication(client: TestClient, db_session) -> None:
-    owner = Owner(display_name="auth owner")
+    owner = Owner(username="auth_owner", display_name="auth owner")
     db_session.add(owner)
     db_session.commit()
     digest = __import__("hashlib").sha256(b"test-token").hexdigest()
-    db_session.add(OwnerCredential(owner_id=owner.id, token_sha256=digest))
+    db_session.add(OwnerCredential(owner_username=owner.username, token_sha256=digest))
     db_session.commit()
     factory = sessionmaker(bind=db_session.get_bind(), expire_on_commit=False)
     def override_db():
@@ -96,10 +96,10 @@ def test_create_session_is_owner_scoped_idempotent_and_waits_for_device_ack(clie
 
 def test_unowned_device_is_hidden_and_cancel_only_cancels_unstarted_session(client: TestClient, db_session) -> None:
     owner, device, _service, _transport = setup_owned_device(client, db_session)
-    other = Owner(display_name="other")
+    other = Owner(username="other_user", display_name="other")
     db_session.add(other)
     db_session.commit()
-    client.app.dependency_overrides[get_current_owner_id] = lambda: other.id
+    client.app.dependency_overrides[get_current_owner_username] = lambda: other.username
     response = client.post(
         "/api/v1/sessions",
         json={"device_id": str(device.id), "idempotency_key": str(uuid4())},
@@ -107,7 +107,7 @@ def test_unowned_device_is_hidden_and_cancel_only_cancels_unstarted_session(clie
     assert response.status_code == 404
     assert db_session.scalar(select(MeasurementSession)) is None
 
-    client.app.dependency_overrides[get_current_owner_id] = lambda: owner.id
+    client.app.dependency_overrides[get_current_owner_username] = lambda: owner.username
     session = MeasurementSession(device_id=device.id, lifecycle="created", data_provenance="device_live")
     db_session.add(session)
     db_session.commit()
@@ -125,7 +125,7 @@ def test_stop_request_requires_current_device_state_and_completion_ack(client: T
     start = service_command = __import__("app.services.session_lifecycle", fromlist=["make_command"]).make_command(
         device.id, session.id, DeviceCommandType.START, 15
     )
-    service.publish_command(service_command, owner_id=device.owner_id)
+    service.publish_command(service_command, owner_username=device.owner_username)
     start_response = {
         "schema_version": "1", "response_id": str(uuid4()), "command_id": str(start.command_id),
         "device_id": str(device.id), "status": "completed", "device_state": "measuring",
