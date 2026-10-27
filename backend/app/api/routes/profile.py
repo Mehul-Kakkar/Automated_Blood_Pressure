@@ -10,7 +10,9 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db_session
 from app.models import Owner
 from app.schemas.profile import AvatarUpdateRequest, ProfileResponse, ProfileUpdateRequest
+from app.schemas.auth import PasswordUpdateRequest
 from app.security.auth import get_current_owner_username
+from app.security.passwords import hash_password
 
 router = APIRouter(prefix="/api/v1/profile", tags=["profile"])
 Db = Annotated[Session, Depends(get_db_session)]
@@ -33,7 +35,8 @@ def _owner(db: Session, username: str) -> Owner:
 
 def _response(owner: Owner) -> ProfileResponse:
     return ProfileResponse(username=owner.username, display_name=owner.display_name,
-                           created_at=owner.created_at, avatar_available=owner.avatar_data is not None)
+                           created_at=owner.created_at, avatar_available=owner.avatar_data is not None,
+                           password_enabled=owner.password_hash is not None)
 
 
 @router.get("", response_model=ProfileResponse)
@@ -45,6 +48,17 @@ def get_profile(db: Db, username: OwnerUsername) -> ProfileResponse:
 def update_profile(body: ProfileUpdateRequest, db: Db, username: OwnerUsername) -> ProfileResponse:
     owner = _owner(db, username)
     owner.display_name = body.display_name
+    db.commit()
+    db.refresh(owner)
+    return _response(owner)
+
+
+@router.put("/password", response_model=ProfileResponse)
+def set_initial_password(body: PasswordUpdateRequest, db: Db, username: OwnerUsername) -> ProfileResponse:
+    owner = _owner(db, username)
+    if owner.password_hash is not None:
+        raise HTTPException(status_code=409, detail="A password is already set. Use account recovery to change it.")
+    owner.password_hash = hash_password(body.password)
     db.commit()
     db.refresh(owner)
     return _response(owner)

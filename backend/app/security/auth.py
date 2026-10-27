@@ -1,6 +1,7 @@
 """Owner-scoped bearer credential authentication for session APIs."""
 
 import hashlib
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, status
@@ -27,6 +28,7 @@ def get_current_owner_username(
         select(OwnerCredential).where(
             OwnerCredential.token_sha256 == token_hash,
             OwnerCredential.revoked_at.is_(None),
+            (OwnerCredential.expires_at.is_(None) | (OwnerCredential.expires_at > datetime.now(timezone.utc))),
         )
     )
     if credential is None:

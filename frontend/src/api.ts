@@ -32,7 +32,8 @@ const SamplesSchema = z.object({
 const ReportSchema = z.object({ id: z.string().uuid(), session_id: z.string().uuid(), report_version: z.string(), generator_version: z.string(),
   status: z.string(), validation_status: z.string().nullable(), sample_count: z.number().nullable(), content_sha256: z.string().nullable(),
   generated_at: z.string().nullable(), report: z.record(z.string(), z.unknown()).nullable().optional() })
-const ProfileSchema = z.object({ username: z.string(), display_name: z.string(), created_at: z.string(), avatar_available: z.boolean() })
+const ProfileSchema = z.object({ username: z.string(), display_name: z.string(), created_at: z.string(), avatar_available: z.boolean(), password_enabled: z.boolean() })
+const AuthSchema = z.object({ access_token: z.string().min(1), token_type: z.literal('bearer'), expires_at: z.string(), username: z.string(), display_name: z.string() })
 const ApiErrorSchema = z.object({ error: z.object({ code: z.string(), message: z.string(), details: z.array(z.unknown()).optional() }) })
 
 export type Device = z.infer<typeof DeviceSchema>
@@ -43,6 +44,7 @@ export type SamplesPage = z.infer<typeof SamplesSchema>
 export type SessionPage = z.infer<typeof SessionPageSchema>
 export type Report = z.infer<typeof ReportSchema>
 export type Profile = z.infer<typeof ProfileSchema>
+export type AuthResult = z.infer<typeof AuthSchema>
 export type SessionEvent = { id?: number; event_id?: string; session_id?: string | null; event_type: string; data?: Record<string, unknown> }
 export type ApiFailureKind = 'configuration' | 'timeout' | 'authorization' | 'validation' | 'server' | 'network' | 'response'
 export class ApiError extends Error { constructor(message: string, readonly kind: ApiFailureKind, readonly status?: number) { super(message); this.name = 'ApiError' } }
@@ -50,7 +52,7 @@ export class ApiError extends Error { constructor(message: string, readonly kind
 export class BackendApi {
   private token?: string
   constructor(private readonly baseUrl = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '') ?? '',
-              private readonly fetcher: typeof fetch = fetch) {}
+              private readonly fetcher: typeof fetch = window.fetch.bind(window)) {}
   setToken(token?: string) { this.token = token?.trim() || undefined }
   get configured() { return this.baseUrl.length > 0 }
 
@@ -75,7 +77,12 @@ export class BackendApi {
     } catch (error) {
       if (error instanceof ApiError) throw error
       if (error instanceof DOMException && error.name === 'AbortError') throw new ApiError('The backend request timed out.', 'timeout')
-      throw new ApiError('The backend could not be reached.', 'network')
+      console.error('[API debug] Original fetch error:', error)
+
+throw new ApiError(
+  `The backend could not be reached: ${error instanceof Error ? error.message : String(error)}`,
+  'network'
+)
     } finally { if (timer !== undefined) clearTimeout(timer) }
   }
   private async json<T>(path: string, schema: z.ZodType<T>, init?: RequestInit): Promise<T> {
@@ -84,6 +91,12 @@ export class BackendApi {
   }
   async health() { return this.json('/health', HealthSchema) }
   async readiness() { return this.json('/ready', z.object({ status: z.string(), database: z.object({ status: z.string() }).optional() })) }
+  async register(username: string, displayName: string, password: string) {
+    return this.json('/api/v1/auth/register', AuthSchema, { method: 'POST', body: JSON.stringify({ username, display_name: displayName, password }) })
+  }
+  async login(username: string, password: string) {
+    return this.json('/api/v1/auth/login', AuthSchema, { method: 'POST', body: JSON.stringify({ username, password }) })
+  }
   async listDevices() { return this.json('/api/v1/devices', z.object({ items: z.array(DeviceSchema) })) }
   async getDevice(id: string) { return this.json(`/api/v1/devices/${encodeURIComponent(id)}`, DeviceSchema) }
   async registerDevice(deviceIdentifier: string, hardwareRevision?: string) {
@@ -103,6 +116,7 @@ export class BackendApi {
   async downloadReport(id: string): Promise<Blob> { return (await this.request(`/api/v1/sessions/${encodeURIComponent(id)}/report.pdf`, { headers: { Accept: 'application/pdf' } })).blob() }
   async getProfile() { return this.json('/api/v1/profile', ProfileSchema) }
   async updateProfile(displayName: string) { return this.json('/api/v1/profile', ProfileSchema, { method: 'PUT', body: JSON.stringify({ display_name: displayName }) }) }
+  async setInitialPassword(password: string) { return this.json('/api/v1/profile/password', ProfileSchema, { method: 'PUT', body: JSON.stringify({ password }) }) }
   async uploadAvatar(file: File) {
     if (file.size > 1_048_576) throw new ApiError('Profile image must be no larger than 1 MiB.', 'validation')
     if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type)) throw new ApiError('Choose a PNG, JPEG, WebP or GIF image.', 'validation')

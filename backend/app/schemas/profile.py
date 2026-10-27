@@ -13,6 +13,7 @@ class ProfileResponse(BaseModel):
     display_name: str
     created_at: datetime
     avatar_available: bool
+    password_enabled: bool
 
 
 class ProfileUpdateRequest(BaseModel):

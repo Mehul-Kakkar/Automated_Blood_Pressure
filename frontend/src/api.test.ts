@@ -41,7 +41,7 @@ describe('typed backend API client', () => {
   expect(seenUrl).toContain('/api/v1/sessions?limit=10&offset=20')
  })
  it('reads and updates username and display name as separate profile fields', async () => {
-  const profile={username:'device_owner',display_name:'Local Owner',created_at:'2026-01-01T00:00:00Z',avatar_available:false}
+  const profile={username:'device_owner',display_name:'Local Owner',created_at:'2026-01-01T00:00:00Z',avatar_available:false,password_enabled:true}
   const seen:RequestInit[]=[]
   const api=new BackendApi('http://api.test',async(_url,init)=>{seen.push(init??{});return response({...profile,...(init?.method==='PUT'?{display_name:'Updated Name'}:{})})})
   api.setToken('profile-owner-token')
@@ -49,5 +49,14 @@ describe('typed backend API client', () => {
   expect(await api.updateProfile('Updated Name')).toMatchObject({username:'device_owner',display_name:'Updated Name'})
   expect(new Headers(seen[1].headers).get('Authorization')).toBe('Bearer profile-owner-token')
   expect(JSON.parse(String(seen[1].body))).toEqual({display_name:'Updated Name'})
+ })
+ it('registers and signs in through password endpoints without putting credentials in the token response body', async () => {
+  const requests:Array<{url:string;body:unknown}> = []
+  const fetcher:typeof fetch=async(url,init)=>{requests.push({url:String(url),body:init?.body?JSON.parse(String(init.body)):undefined});return response({access_token:'one-time-bearer',token_type:'bearer',expires_at:'2026-01-02T00:00:00Z',username:'device_owner',display_name:'Local Owner'})}
+  const api=new BackendApi('https://backend.example.test',fetcher)
+  expect((await api.register('Device_Owner','Local Owner','correct horse battery staple')).access_token).toBe('one-time-bearer')
+  expect((await api.login('device_owner','correct horse battery staple')).username).toBe('device_owner')
+  expect(requests.map(x=>x.url)).toEqual(['https://backend.example.test/api/v1/auth/register','https://backend.example.test/api/v1/auth/login'])
+  expect(requests[0].body).toMatchObject({username:'Device_Owner',display_name:'Local Owner'})
  })
 })

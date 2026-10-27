@@ -20,6 +20,7 @@ class Owner(Base):
     # Preserves the pre-username UUID identity for audit and migration compatibility.
     legacy_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False, default=uuid4)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    password_hash: Mapped[str | None] = mapped_column(String(256))
     avatar_data: Mapped[bytes | None] = mapped_column(LargeBinary)
     avatar_content_type: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -38,5 +39,6 @@ class OwnerCredential(Base):
     token_sha256: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
     owner: Mapped[Owner] = relationship(back_populates="credentials")

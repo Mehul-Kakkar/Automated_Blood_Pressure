@@ -32,7 +32,7 @@ def test_initial_migration_up_and_down_against_temporary_sqlite(tmp_path: Path) 
     session_columns = {column["name"] for column in inspect(engine).get_columns("measurement_sessions")}
     assert {"owner_username", "state_reported_at", "pressure_calibration_confirmed"}.issubset(device_columns)
     owner_columns = {column["name"] for column in inspect(engine).get_columns("owners")}
-    assert {"username", "legacy_id", "display_name", "avatar_data"}.issubset(owner_columns)
+    assert {"username", "legacy_id", "display_name", "avatar_data", "password_hash"}.issubset(owner_columns)
     assert "owner_username" in {column["name"] for column in inspect(engine).get_columns("owner_credentials")}
     assert "client_request_id" in session_columns
     report_columns = {column["name"] for column in inspect(engine).get_columns("reports")}
