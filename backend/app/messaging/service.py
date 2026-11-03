@@ -28,7 +28,7 @@ from app.messaging.transport import IncomingMessage, MQTTTransport, PahoMQTTTran
 from app.models import Device, DeviceCommand, DeviceCommandStatus, MeasurementSession, SessionEvent, TelemetrySample
 from app.schemas.telemetry import TelemetryBatchInput
 from app.services.telemetry import ingest_telemetry_batch
-from app.services.session_lifecycle import record_session_event
+from app.services.session_lifecycle import make_command, record_session_event
 
 logger = logging.getLogger("api.messaging")
 
@@ -313,10 +313,15 @@ class MessagingService:
         else:
             raise MessageRejected("Backend does not accept messages on command topics.")
 
-    def _require_enrolled_device(self, db: Session, topic_device_id: UUID, payload_device_id: UUID) -> Device:
+    def _require_enrolled_device(
+        self, db: Session, topic_device_id: UUID, payload_device_id: UUID, *, lock: bool = False
+    ) -> Device:
         if topic_device_id != payload_device_id:
             raise DeviceIdentityRejected("Device ID does not match topic identity.")
-        device = db.get(Device, topic_device_id)
+        statement = select(Device).where(Device.id == topic_device_id)
+        if lock:
+            statement = statement.with_for_update()
+        device = db.scalar(statement)
         if device is None or not device.mqtt_enabled or device.mqtt_principal != str(topic_device_id):
             raise DeviceIdentityRejected("Device is not enrolled for MQTT messaging.")
         return device
@@ -375,9 +380,11 @@ class MessagingService:
             status = DeviceStatusMessage.model_validate(body)
         except Exception as exc:
             raise MessageRejected("Status schema validation failed.") from exc
+        if status.start_request_id is not None:
+            self._handle_device_start_request(topic, status)
         with self.session_factory() as db:
             with db.begin():
-                device = self._require_enrolled_device(db, topic.device_id, status.device_id)
+                device = self._require_enrolled_device(db, topic.device_id, status.device_id, lock=True)
                 measurement_session = None
                 if status.session_id is not None:
                     measurement_session = db.get(MeasurementSession, status.session_id)
@@ -412,6 +419,21 @@ class MessagingService:
                         ):
                             measurement_session.lifecycle = "completed"
                             measurement_session.ended_at = datetime.now(timezone.utc)
+                        elif (
+                            status.state == DeviceReportedState.STOPPED
+                            and measurement_session.lifecycle == "measuring"
+                            and measurement_session.started_at is not None
+                        ):
+                            # A physical display may stop locally; only an
+                            # explicit device STOPPED report ends the shared session.
+                            measurement_session.lifecycle = "completed"
+                            measurement_session.ended_at = datetime.now(timezone.utc)
+                            measurement_session.termination_reason = "device_local_stop_confirmed"
+                        elif status.state == DeviceReportedState.FAULT and measurement_session.lifecycle in {
+                            "created", "starting", "measuring", "stopping"
+                        }:
+                            measurement_session.lifecycle = "interrupted"
+                            measurement_session.termination_reason = "device_fault_reported"
                     device.reported_lost_sample_count = status.lost_sample_count
                 device.last_seen_at = datetime.now(timezone.utc)
                 if not out_of_order and status.firmware_version:
@@ -450,6 +472,96 @@ class MessagingService:
                         device_sequence=status.sequence,
                         device_recorded_at=status.reported_at,
                     )
+
+    def _handle_device_start_request(self, topic: DeviceTopic, status: DeviceStatusMessage) -> None:
+        """Create/reuse an owner-scoped session and dispatch its normal START command.
+
+        MQTT ACL identity plus the existing trusted-enrollment row authorizes the
+        device request. No owner credential or username is accepted from payload.
+        """
+        if self.session_factory is None or status.start_request_id is None:
+            raise RuntimeError("Database or start request is unavailable.")
+        dispatch_session_id: UUID | None = None
+        owner_username: str | None = None
+        request_event_id = uuid5(status.start_request_id, "device-start-request")
+        active_lifecycles = {"created", "starting", "measuring", "stopping", "interrupted"}
+        with self.session_factory() as db:
+            with db.begin():
+                device = self._require_enrolled_device(db, topic.device_id, status.device_id, lock=True)
+                if not device.owner_username:
+                    raise DeviceIdentityRejected("Device must be associated with an owner before it can request a session.")
+                owner_username = device.owner_username
+                by_request = db.scalar(
+                    select(MeasurementSession).where(
+                        MeasurementSession.device_id == device.id,
+                        MeasurementSession.client_request_id == status.start_request_id,
+                    )
+                )
+                request_event = db.scalar(
+                    select(SessionEvent).where(
+                        SessionEvent.device_id == device.id,
+                        SessionEvent.event_id == request_event_id,
+                    )
+                )
+                device_originated = request_event is not None
+                session = by_request
+                if session is None:
+                    session = db.scalar(
+                        select(MeasurementSession)
+                        .where(
+                            MeasurementSession.device_id == device.id,
+                            MeasurementSession.lifecycle.in_(active_lifecycles),
+                        )
+                        .order_by(MeasurementSession.created_at.desc(), MeasurementSession.id.desc())
+                        .limit(1)
+                    )
+                if session is None:
+                    session = MeasurementSession(
+                        device_id=device.id,
+                        client_request_id=status.start_request_id,
+                        lifecycle="created",
+                        data_provenance="device_live",
+                    )
+                    db.add(session)
+                    db.flush()
+                    device_originated = True
+                    record_session_event(
+                        db,
+                        device_id=device.id,
+                        session_id=session.id,
+                        event_type="device_start_requested",
+                        event_id=request_event_id,
+                        device_sequence=status.sequence,
+                        device_recorded_at=status.reported_at,
+                        data={"request_id": str(status.start_request_id), "lifecycle": "created"},
+                    )
+                status.session_id = session.id
+                if device_originated and session.lifecycle == "created":
+                    existing_start = db.scalar(
+                        select(DeviceCommand.id).where(
+                            DeviceCommand.device_id == device.id,
+                            DeviceCommand.session_id == session.id,
+                            DeviceCommand.command_type == DeviceCommandType.START.value,
+                        ).limit(1)
+                    )
+                    if existing_start is None:
+                        dispatch_session_id = session.id
+
+        # Publish after the session row commits. A failed/uncertain publish is
+        # handled by the existing command lifecycle and never reports measuring.
+        if dispatch_session_id is not None and owner_username is not None:
+            try:
+                self.publish_command(
+                    make_command(
+                        topic.device_id,
+                        dispatch_session_id,
+                        DeviceCommandType.START,
+                        self.settings.mqtt_command_ttl_seconds,
+                    ),
+                    owner_username=owner_username,
+                )
+            except MessagingError:
+                logger.info("device_originated_start_dispatch_failed", extra={"event": "device_originated_start_dispatch_failed"})
 
     def _handle_response(self, topic: DeviceTopic, body: dict[str, object]) -> None:
         if self.session_factory is None:

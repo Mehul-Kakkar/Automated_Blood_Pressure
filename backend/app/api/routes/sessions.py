@@ -40,8 +40,11 @@ Db = Annotated[Session, Depends(get_db_session)]
 OwnerUsername = Annotated[str, Depends(get_current_owner_username)]
 
 
-def _require_owned_device(db: Session, owner_username: str, device_id: UUID) -> Device:
-    device = db.scalar(select(Device).where(Device.id == device_id, Device.owner_username == owner_username))
+def _require_owned_device(db: Session, owner_username: str, device_id: UUID, *, lock: bool = False) -> Device:
+    statement = select(Device).where(Device.id == device_id, Device.owner_username == owner_username)
+    if lock:
+        statement = statement.with_for_update()
+    device = db.scalar(statement)
     if device is None:
         raise HTTPException(status_code=404, detail="Device was not found.")
     return device
@@ -76,7 +79,9 @@ def create_session(
     owner_username: OwnerUsername,
 ) -> SessionResponse:
     settings: Settings = request.app.state.settings
-    device = _require_owned_device(db, owner_username, body.device_id)
+    # Serialize concurrent phone/display starts for this device. The device row
+    # lock protects the active-session check without changing account identity.
+    device = _require_owned_device(db, owner_username, body.device_id, lock=True)
     existing = db.scalar(
         select(MeasurementSession).where(
             MeasurementSession.device_id == device.id,
@@ -88,6 +93,18 @@ def create_session(
         return _view(db, existing, device, settings)
     if not device.mqtt_enabled or device.mqtt_principal != str(device.id):
         raise HTTPException(status_code=409, detail="The device is not enrolled for remote messaging.")
+    active_session = db.scalar(
+        select(MeasurementSession)
+        .where(
+            MeasurementSession.device_id == device.id,
+            MeasurementSession.lifecycle.in_({"created", "starting", "measuring", "stopping", "interrupted"}),
+        )
+        .order_by(MeasurementSession.created_at.desc(), MeasurementSession.id.desc())
+        .limit(1)
+    )
+    if active_session is not None:
+        response.status_code = status.HTTP_200_OK
+        return _view(db, active_session, device, settings)
     _require_fresh_state(device, settings, "idle")
 
     session = MeasurementSession(

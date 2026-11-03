@@ -18,7 +18,7 @@ from app.messaging.service import (
     DuplicateCommandId,
     MessagingService,
 )
-from app.models import Device, DeviceCommand, MeasurementSession, SessionEvent, TelemetrySample
+from app.models import Device, DeviceCommand, MeasurementSession, Owner, SessionEvent, TelemetrySample
 from tests.test_persistence import make_payload
 
 
@@ -149,6 +149,44 @@ def test_status_message_requires_matching_enrolled_device_identity(db_session: S
     assert transport.acks == [(5, 1)]
     db_session.expire_all()
     assert db_session.get(Device, device.id).reported_state == "idle"
+
+
+def test_display_start_request_creates_one_owner_scoped_session_and_start_command(db_session: Session) -> None:
+    owner = Owner(username="display_owner", display_name="Display Owner")
+    db_session.add(owner)
+    device = Device(device_identifier=f"display-start-{uuid4()}", owner_username=owner.username,
+                    mqtt_enabled=True, reported_state="idle")
+    db_session.add(device)
+    db_session.flush()
+    device.mqtt_principal = str(device.id)
+    db_session.commit()
+    service, transport = make_service(db_session)
+    transport.connect_callback()
+    request_id = uuid4()
+    payload = {"schema_version": "1", "message_id": str(uuid4()), "device_id": str(device.id),
+               "sequence": 1, "state": "idle", "start_request_id": str(request_id)}
+
+    transport.send(f"bp/v1/devices/{device.id}/status", json.dumps(payload).encode(), mid=51)
+    service.process_one()
+    db_session.expire_all()
+    session = db_session.scalar(select(MeasurementSession).where(MeasurementSession.client_request_id == request_id))
+    command = db_session.scalar(select(DeviceCommand).where(DeviceCommand.session_id == session.id))
+
+    assert service.health["processing_error_count"] == 0
+    assert service.health["rejected_count"] == 0
+    assert session is not None and session.device_id == device.id
+    assert session.lifecycle == "starting"
+    assert command is not None and command.command_type == "START"
+    assert db_session.get(Device, device.id).owner_username == owner.username
+    assert len(transport.publishes) == 1
+    assert json.loads(transport.publishes[0][1])["session_id"] == str(session.id)
+
+    payload["message_id"] = str(uuid4())
+    payload["sequence"] = 2
+    transport.send(f"bp/v1/devices/{device.id}/status", json.dumps(payload).encode(), mid=52)
+    service.process_one()
+    assert db_session.scalar(select(MeasurementSession.id).where(MeasurementSession.client_request_id == request_id)) == session.id
+    assert len(transport.publishes) == 1
 
 
 def test_telemetry_topic_and_payload_device_must_match(db_session: Session) -> None:

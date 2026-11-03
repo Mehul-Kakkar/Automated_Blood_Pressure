@@ -1,0 +1,72 @@
+Phone BLE GATT protocol, version 1
+==================================
+
+Radio roles
+-----------
+The main ESP32-S3 is the BLE peripheral/GATT server. The phone is the central.
+The separate display remains connected to the main controller over ESP-NOW.
+Wi-Fi/MQTT remains independent of both links. BLE connection state never starts
+or stops measurement by itself.
+
+Advertised device: Pulsefield BP
+Service: 4b505001-6b70-4c46-9c87-687572617465
+
+Characteristics
+---------------
+UUID suffix  Property      Content
+...5002      Read          Device info JSON
+...5003      Read/Notify   Controller state, uptime, session, fault, calibration
+...5004      Read/Notify   Raw pressure counts; mmHg is null until calibrated
+...5005      Read/Notify   Heart rate; null until actually available
+...5006      Read/Notify   Korotkoff event count; unavailable until implemented
+...5007      Read/Notify   Progress; unavailable until a validated estimator exists
+...5008      Write        Phone command JSON
+...5009      Notify       Command acknowledgement JSON
+...500a      Read/Notify   Fault code and controller state
+
+Commands are UTF-8 JSON, max 128 bytes:
+{"v":1,"command_id":"<UUID>","command":"GET_STATUS"}
+Supported command names: GET_STATUS, GET_DEVICE_INFO, REQUEST_LIVE_DATA,
+START_MEASUREMENT, STOP_MEASUREMENT. Unknown or malformed messages are ignored
+or rejected; duplicate command IDs are rejected during the current boot.
+
+Acknowledgement:
+{"v":1,"command_id":"<UUID>","ok":false,"error_code":"...","state":"fault"}
+The command ID matches the request. `ok` is true only when the local command
+manager reports completion. A GATT write acknowledgement alone is not success.
+
+Security and operating limits
+-----------------------------
+This prototype does not configure BLE pairing/bonding or authenticated GATT
+permissions. The phone's browser chooser requires explicit user selection, but
+that is not a substitute for link encryption; do not use this BLE link where
+nearby hostile clients are in scope. Firmware validates protocol/version,
+command names, UUID command IDs, duplicate IDs, state and safety checks. It does
+not expose arbitrary GPIO commands. BLE is for Android Chrome/Web Bluetooth on
+HTTPS (or localhost); iOS Safari does not currently provide the required Web
+Bluetooth API.
+
+Phone test guide
+----------------
+1. Flash the main ESP32-S3 firmware and open its serial monitor. It should log
+   `Phone BLE GATT advertising started`; the main loop must continue if BLE is
+   absent.
+2. Serve the frontend on HTTPS and open it in Android Chrome. On Device, choose
+   Connect phone over BLE and select Pulsefield BP in the browser chooser.
+3. The page should show connected and display controller state/fault notifications.
+   Connection causes only GET_STATUS; it must not start a measurement.
+4. Send GET_STATUS or REQUEST_LIVE_DATA and confirm a matching command ID ack.
+5. Press Start measurement explicitly. With the current unverified calibration,
+   pin map and valve behavior, expect a safety rejection. A successful GATT write
+   is not evidence that a measurement started.
+6. STOP_MEASUREMENT is accepted only through the local command manager. Stop
+   cannot claim safe cuff release until the valve behavior and pressure endpoint
+   are verified.
+7. Disconnect the phone during operation. Local sensor polling and safety code
+   must continue. Reconnect and verify the UI requests fresh status; old START
+   requests are never replayed.
+8. Boot with no phone and no display. Verify the controller remains autonomous
+   and the independent ESP-NOW display link still works when that board is on.
+
+Compilation requires Arduino-ESP32 core 3.x, PubSubClient 2.8.x and ArduinoJson
+6.21.x. BLEDevice/BLEServer/BLE2902 are supplied by the ESP32 core.

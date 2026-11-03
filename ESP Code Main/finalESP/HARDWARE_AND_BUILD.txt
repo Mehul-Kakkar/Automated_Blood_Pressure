@@ -1,0 +1,15 @@
+Hardware findings and build/provisioning notes
+
+Pin map derived from checked-in sketches:
+- Microphone ADC: GPIO4 (`korotkoffDebug.ino`), 2 kHz sampling. Existing HP/LP coefficients and event thresholds are retained.
+- HX710B OUT/SCK: GPIO8/GPIO9 (`pumpvalveTest.ino`); only signed raw counts are read. No mmHg conversion is present.
+- L298N pump IN1/IN2/EN: GPIO5/GPIO4/GPIO15 (`pumpvalveTest.ino`). GPIO4 conflicts with the microphone ADC. The final firmware never configures or drives pump IN2 and hard-disables pump start.
+- L298N valve IN1/IN2/EN: GPIO6/GPIO7/GPIO16 (`pumpvalveTest.ino`). Existing test explicitly says energized valve behavior is not known to open or close. Release control remains disabled.
+
+Before a hardware build is considered usable, physically resolve the GPIO4 conflict, confirm the actual board/harness mapping, bench-verify the valve's de-energized/energized behavior and fail-safe state, and validate the HX710B sensor against a traceable pressure reference. A zero-count capture is not calibration. Do not change the false calibration/pin/valve/inflation constants in config.h from guesswork. No clinical pressure threshold has been invented.
+
+Dependencies: Arduino-ESP32 core 3.x, PubSubClient 2.8.x, ArduinoJson 6.21.x. Compile/upload the `finalESP.ino` sketch folder for the exact ESP32-S3 board selected in Arduino IDE/CLI. The separate `DisplayCode/finalDisplay/finalDisplay.ino` needs Arduino-ESP32 core 3.x and ArduinoJson 6.21.x. Match the configured ESP-NOW channel on both boards and the Wi-Fi AP.
+
+For MQTT, copy `secrets.example.h` to local `secrets.h` (the latter is git-ignored), then set the actual Wi-Fi SSID/password, enrolled device UUID, per-device MQTT username/password, broker hostname/port, and trusted broker CA PEM. Never use plaintext MQTT or a skip-verification TLS mode. The broker must ACL the device principal to publish only its own telemetry/status/responses and subscribe only to its own commands topic. Firmware subscribes/publishes the backend's bp/v1/devices/{device_id}/{commands,telemetry,status,responses} topics.
+
+This folder contains firmware/configuration only. It cannot create a backend session for a touchscreen START because the current backend schema/service has no device-originated session-request message. The display START therefore needs a backend session_id or is rejected. Backend enrollment/provisioning, frontend synchronization, and backend tests remain in the backend/frontend project scope and were not edited under the folder-only constraint.

@@ -94,6 +94,21 @@ def test_create_session_is_owner_scoped_idempotent_and_waits_for_device_ack(clie
     assert client.get(f"/api/v1/sessions/{session_id}").json()["lifecycle"] == "measuring"
 
 
+def test_phone_start_reuses_active_display_session(client: TestClient, db_session) -> None:
+    _owner, device, _service, transport = setup_owned_device(client, db_session)
+    display_request_id = uuid4()
+    shared = MeasurementSession(device_id=device.id, client_request_id=display_request_id,
+                               lifecycle="starting", data_provenance="device_live")
+    db_session.add(shared)
+    db_session.commit()
+
+    response = client.post("/api/v1/sessions", json={"device_id": str(device.id), "idempotency_key": str(uuid4())})
+
+    assert response.status_code == 200
+    assert response.json()["id"] == str(shared.id)
+    assert len(transport.publishes) == 0
+
+
 def test_unowned_device_is_hidden_and_cancel_only_cancels_unstarted_session(client: TestClient, db_session) -> None:
     owner, device, _service, _transport = setup_owned_device(client, db_session)
     other = Owner(username="other_user", display_name="other")

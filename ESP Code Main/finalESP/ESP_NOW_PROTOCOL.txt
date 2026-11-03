@@ -1,0 +1,11 @@
+ESP-NOW v1 wire protocol (compatible with repository espnowTest/finalDisplay sketches)
+
+Frame layout, packed: uint32 magic 0x42505031; uint16 version 1; uint16 sequence; char type[16]; char payload[180]. Main and display use the same fixed 204-byte layout. `ESP_NOW_CHANNEL` must match on both ESP32-S3 boards; the existing test sketches use channel 1. If the Wi-Fi AP is on a different channel, ESP-NOW and Wi-Fi channel coexistence must be resolved in the deployment configuration.
+
+Types:
+- Display -> main: PING with JSON source/protocol_version.
+- Main -> display: PONG; MAIN_STATUS with state, uptime_ms, raw pressure count when fresh, pressure_mmhg=null, pressure_calibrated=false, heart_rate_bpm=null, fault.
+- Display -> main: COMMAND with `{"cmd":"START","request_id":"<uuid>","session_id":"<uuid>"}`; COMMAND with `{"cmd":"STOP"}`; COMMAND with `{"cmd":"STATUS_REQUEST"}`.
+- Main -> display: ACK with ack_sequence, result, reason, state. The sequence correlates acknowledgements. START from the display requires a backend-created session_id; absent one, the main rejects it as backend_session_required.
+
+Both endpoints track a 32-packet sequence window and reject duplicates/replays inside that window. The legacy format is retained for compatibility. Discovery currently uses the existing broadcast-peer test approach; it is not encrypted/authenticated and must not be treated as a production security boundary. No GPIO or display-driver assumptions are made by the display sketch.

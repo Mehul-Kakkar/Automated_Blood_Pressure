@@ -37,6 +37,9 @@ class DeviceStatusMessage(StrictEnvelope):
     firmware_version: str | None = Field(default=None, max_length=64)
     processing_algorithm_version: str | None = Field(default=None, max_length=64)
     session_id: UUID | None = None
+    # Idempotency key for a physical display Start tap. The broker-authenticated
+    # device identity supplies authorization; this never accepts an owner name.
+    start_request_id: UUID | None = None
     lost_sample_count: int = Field(default=0, ge=0, le=2**63 - 1)
     reported_at: datetime | None = None
 
@@ -46,6 +49,12 @@ class DeviceStatusMessage(StrictEnvelope):
         if value is not None and value.utcoffset() is None:
             raise ValueError("reported_at must include a timezone offset")
         return value
+
+    @model_validator(mode="after")
+    def start_request_is_idle_and_unassociated(self) -> "DeviceStatusMessage":
+        if self.start_request_id is not None and (self.state != DeviceReportedState.IDLE or self.session_id is not None):
+            raise ValueError("start_request_id is only valid on idle status without a session_id")
+        return self
 
 
 class DeviceCommandType(str, Enum):

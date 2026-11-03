@@ -1,0 +1,6 @@
+Required Arduino libraries:
+- PubSubClient 2.8.x (TLS transport supplied by ESP32 WiFiClientSecure)
+- ArduinoJson 6.21.x
+- Arduino-ESP32 core 3.x built-in BLE library (BLEDevice/BLEServer/BLE2902)
+
+Required platform: Arduino-ESP32 core 3.x for the ESP-NOW receive callback API used here.

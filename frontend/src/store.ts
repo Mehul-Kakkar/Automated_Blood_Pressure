@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { ApiError, backendApi, type Device, type RemoteAcousticEvent, type RemoteSample, type RemoteSession } from './api'
 import { DemoDevice, type Session, type SessionState, type Telemetry } from './domain'
+import { phoneBle, type PhoneBleEvent } from './ble'
 
 type SyncState = 'not_applicable' | 'pending' | 'synced' | 'uncertain'
 type Store = {
@@ -9,9 +10,11 @@ type Store = {
   acousticEvents: RemoteAcousticEvent[]; remoteSession?: RemoteSession; devices: Device[]; selectedDeviceId?: string
   startedAt?: number; busy: boolean; error?: string; apiToken?: string; sessionSync: SyncState
   startRequestId?: string
+  bleDeviceName?: string; bleState?: string; blePressureRaw?: number; bleFault?: string; bleError?: string; bleConnectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
   setApiToken: (token?: string) => void; refreshBackend: () => Promise<void>; refreshDevices: () => Promise<void>
   selectDevice: (id: string) => void; loadHistory: (offset?: number) => Promise<void>; refreshRemoteSession: () => Promise<RemoteSession | undefined>
   connect: () => Promise<void>; startFromHome: () => Promise<boolean>; start: () => Promise<void>; stop: () => Promise<void>
+  connectPhone: () => Promise<void>; disconnectPhone: () => void; sendPhoneCommand: (command: 'GET_STATUS' | 'START_MEASUREMENT' | 'STOP_MEASUREMENT' | 'REQUEST_LIVE_DATA' | 'GET_DEVICE_INFO') => Promise<void>
   resetSession: () => void; addSample: (sample: Telemetry) => void; clearError: () => void; setDemo: (value: boolean) => void
   simulateDisconnect: () => void; simulateFault: () => void; appendRemoteSamples: (samples: RemoteSample[], events: RemoteAcousticEvent[]) => void
 }
@@ -19,6 +22,7 @@ const demoDevice = new DemoDevice()
 const initialDemo = import.meta.env.DEV && import.meta.env.VITE_DEMO_MODE === 'true'
 let unsubscribeDemo: (() => void) | undefined
 let remoteAbort: AbortController | undefined
+let liveSessionId: string | undefined
 let lastSampleOffset = 0
 const CONFIRM_TIMEOUT_MS = 20000
 const POLL_INTERVAL_MS = 800
@@ -48,6 +52,7 @@ export const useAppStore = create<Store>((set, get) => ({
   demo: initialDemo, connected: false, bleConnected: false, deviceOnline: false, backendAvailable: false, databaseStatus: 'unknown',
   state: 'disconnected', samples: [], sessions: [], remoteSessions: [], acousticEvents: [], devices: [], busy: false,
   sessionSync: initialDemo ? 'not_applicable' : 'uncertain',
+  bleDeviceName: undefined, bleState: undefined, blePressureRaw: undefined, bleFault: undefined, bleError: undefined, bleConnectionState: 'disconnected',
   setApiToken: token => { const trimmed = token?.trim(); backendApi.setToken(trimmed); set({ apiToken: trimmed || undefined, error: undefined }) },
   refreshBackend: async () => {
     try {
@@ -64,6 +69,44 @@ export const useAppStore = create<Store>((set, get) => ({
     const online = selected?.online === true
     set({ devices: result.items, selectedDeviceId: selected?.id, deviceOnline: online, connected: online,
       state: online && selected?.reported_state === 'idle' && get().state === 'disconnected' ? 'connected_idle' : get().state })
+    if (selected) {
+      const page = await backendApi.listSessions(50, 0)
+      const active = page.items.find(item => item.device_id === selected.id && ['created', 'starting', 'measuring', 'stopping', 'interrupted'].includes(item.lifecycle))
+      const known = get().remoteSession
+      if (active) adoptRemoteSession(active, set, get)
+      else if (known?.device_id === selected.id && ['completed', 'error', 'cancelled'].includes(known.lifecycle)) {
+        set({ remoteSession: undefined, state: selected.reported_state === 'idle' ? 'connected_idle' : get().state })
+      }
+    }
+  },
+  connectPhone: async () => {
+    set({ bleError: undefined, busy: true, bleConnectionState: 'connecting' })
+    try {
+      const name = await phoneBle.connect((event: PhoneBleEvent) => {
+        if (event.kind === 'connected') set({ bleConnected: true, bleConnectionState: 'connected', bleDeviceName: String(event.value.name ?? 'Pulsefield BP'), bleError: undefined })
+        else if (event.kind === 'reconnecting') set({ bleConnected: false, bleConnectionState: 'reconnecting' })
+        else if (event.kind === 'disconnected') set({ bleConnected: false, bleConnectionState: 'disconnected', bleDeviceName: undefined })
+        else if (event.kind === 'state') {
+          const state = String(event.value.state ?? 'unknown')
+          set({ bleState: state, bleFault: String(event.value.fault ?? 'none'),
+            ...(state === 'measuring' || state === 'inflating' || state === 'deflating' ? { state: 'measuring' as SessionState } : {}),
+            ...(state === 'fault' || state === 'emergency_stop' ? { state: 'device_fault' as SessionState } : {}),
+            ...(state === 'idle' && get().state === 'disconnected' ? { state: 'connected_idle' as SessionState } : {}) })
+        } else if (event.kind === 'pressure') set({ blePressureRaw: typeof event.value.raw_counts === 'number' ? event.value.raw_counts : undefined })
+        else if (event.kind === 'fault') set({ bleFault: String(event.value.code ?? 'unknown') })
+        else if (event.kind === 'error') set({ bleError: String(event.value.message ?? 'Phone BLE connection failed.') })
+      })
+      set({ bleConnected: true, bleConnectionState: 'connected', bleDeviceName: name })
+    } catch (error) {
+      phoneBle.disconnect()
+      set({ bleConnected: false, bleConnectionState: 'disconnected', bleError: errorMessage(error, 'Phone BLE connection failed.') })
+      throw error
+    } finally { set({ busy: false }) }
+  },
+  disconnectPhone: () => { phoneBle.disconnect(); set({ bleConnected: false, bleConnectionState: 'disconnected', bleDeviceName: undefined }) },
+  sendPhoneCommand: async command => {
+    try { await phoneBle.send(command); set({ bleError: undefined }) }
+    catch (error) { set({ bleError: errorMessage(error, 'Phone BLE command failed.') }); throw error }
   },
   selectDevice: id => { const device = get().devices.find(item => item.id === id); set({ selectedDeviceId: id, deviceOnline: device?.online === true, connected: device?.online === true, state: device?.online && device.reported_state === 'idle' ? 'connected_idle' : 'disconnected' }) },
   loadHistory: async (offset = 0) => {
@@ -101,9 +144,12 @@ export const useAppStore = create<Store>((set, get) => ({
       await get().refreshDevices()
       const selected = get().devices.find(d => d.id === get().selectedDeviceId)
       if (!selected?.online) throw new ApiError('The selected device is offline or has not been enrolled for MQTT.', 'response')
-      if (selected.reported_state === 'measuring') {
+      const knownSession = get().remoteSession
+      if (selected.reported_state === 'measuring' && knownSession?.device_id !== selected.id) {
         set({ connected: true, deviceOnline: true, state: 'uncertain', error: 'The device reports an active measurement. Select its existing session in History to reconcile; no session was started.' })
-      } else set({ connected: true, deviceOnline: true, state: selected.reported_state === 'idle' ? 'connected_idle' : 'disconnected' })
+      } else set({ connected: true, deviceOnline: true,
+        state: knownSession?.device_id === selected.id && ['created', 'starting', 'measuring', 'stopping', 'interrupted'].includes(knownSession.lifecycle)
+          ? get().state : selected.reported_state === 'idle' ? 'connected_idle' : 'disconnected' })
     } catch (e) { set({ connected: false, deviceOnline: false, state: 'disconnected', error: errorMessage(e, 'Could not check backend/device status.') }) }
     finally { set({ busy: false }) }
   },
@@ -114,6 +160,12 @@ export const useAppStore = create<Store>((set, get) => ({
       set({ busy: true, error: undefined, state: 'connecting' })
       try { if (!current.connected) await demoDevice.connect(); set({ busy: false, connected: true, bleConnected: true, state: 'connected_idle' }); await get().start(); return get().state === 'measuring' }
       catch (e) { set({ busy: false, connected: false, state: 'error', error: errorMessage(e, 'Could not connect to the demo device.') }); return false }
+    }
+    if (current.bleConnected && (!current.apiToken || !current.backendAvailable || !current.deviceOnline)) {
+      set({ busy: true, error: undefined })
+      try { await get().sendPhoneCommand('START_MEASUREMENT'); return get().bleState === 'measuring' }
+      catch (e) { set({ state: get().bleState === 'fault' ? 'device_fault' : 'error', error: errorMessage(e, 'The device rejected Start over phone BLE.') }); return false }
+      finally { set({ busy: false }) }
     }
     set({ busy: true, error: undefined, state: 'connecting', sessionSync: 'pending', samples: [], acousticEvents: [], remoteSession: undefined })
     let commandAttempted = false
@@ -182,6 +234,12 @@ export const useAppStore = create<Store>((set, get) => ({
       } catch (e) { set({ state: 'uncertain', busy: false, error: errorMessage(e, 'Stop could not be confirmed. Check the device.') }) }
       return
     }
+    if (current.bleConnected && (!current.remoteSession || !current.apiToken || !current.backendAvailable)) {
+      set({ state: 'stopping', busy: true, error: undefined })
+      try { await get().sendPhoneCommand('STOP_MEASUREMENT'); set({ busy: false, state: 'uncertain', error: 'The controller acknowledged Stop, but its local state must confirm safe release.' }) }
+      catch (e) { set({ state: 'uncertain', busy: false, error: errorMessage(e, 'Stop was not confirmed over phone BLE.') }) }
+      return
+    }
     const sessionId = current.remoteSession?.id
     if (!sessionId) { set({ state: 'uncertain', error: 'No active server session is associated with the device; stopped state is unknown.' }); return }
     set({ state: 'stopping', busy: true, error: undefined })
@@ -201,7 +259,7 @@ export const useAppStore = create<Store>((set, get) => ({
       set({ state: 'uncertain', busy: false, sessionSync: 'uncertain', error: 'Stop was requested but completion was not confirmed. The device may still be running.' })
     } catch (e) { set({ state: 'uncertain', busy: false, sessionSync: 'uncertain', error: `${errorMessage(e, 'Stop request failed.')} Device stop is not confirmed.` }) }
   },
-  resetSession: () => { const s = get(); if (s.busy || (s.state !== 'completed' && s.state !== 'cancelled')) return; remoteAbort?.abort(); set({ state: s.connected ? 'connected_idle' : 'disconnected', samples: [], acousticEvents: [], startedAt: undefined, remoteSession: undefined, error: undefined }) },
+  resetSession: () => { const s = get(); if (s.busy || (s.state !== 'completed' && s.state !== 'cancelled')) return; remoteAbort?.abort(); liveSessionId = undefined; set({ state: s.connected ? 'connected_idle' : 'disconnected', samples: [], acousticEvents: [], startedAt: undefined, remoteSession: undefined, error: undefined }) },
   addSample: sample => set(s => ({ samples: [...s.samples.slice(-(MAX_BUFFERED_SAMPLES - 1)), sample] })),
   clearError: () => set({ error: undefined }),
   setDemo: value => { const state = get().state; if (!get().busy && state !== 'measuring' && state !== 'stopping' && state !== 'starting') { remoteAbort?.abort(); set({ demo: value, connected: false, bleConnected: false, deviceOnline: false, state: 'disconnected', error: undefined, samples: [], acousticEvents: [], remoteSession: undefined, sessionSync: value ? 'not_applicable' : 'uncertain' }); void demoDevice.disconnect() } },
@@ -210,7 +268,9 @@ export const useAppStore = create<Store>((set, get) => ({
 }))
 
 function beginLiveStream(sessionId: string, set: (partial: Partial<Store>) => void, get: () => Store) {
+  if (liveSessionId === sessionId && remoteAbort && !remoteAbort.signal.aborted) return
   remoteAbort?.abort()
+  liveSessionId = sessionId
   const controller = new AbortController()
   remoteAbort = controller
   lastSampleOffset = 0
@@ -239,6 +299,16 @@ function beginLiveStream(sessionId: string, set: (partial: Partial<Store>) => vo
       if (!controller.signal.aborted) await sleep(1500)
     }
   })()
+}
+
+function adoptRemoteSession(session: RemoteSession, set: (partial: Partial<Store>) => void, get: () => Store) {
+  set({ remoteSession: session, connected: true, deviceOnline: true, startedAt: session.started_at ? Date.parse(session.started_at) : get().startedAt })
+  if (session.lifecycle === 'measuring') {
+    set({ state: 'measuring', sessionSync: 'synced' })
+    beginLiveStream(session.id, set, get)
+  } else if (session.lifecycle === 'starting' || session.lifecycle === 'created') set({ state: 'starting', sessionSync: 'pending' })
+  else if (session.lifecycle === 'stopping') set({ state: 'stopping', sessionSync: 'pending' })
+  else if (session.lifecycle === 'interrupted') set({ state: 'uncertain', sessionSync: 'uncertain' })
 }
 
 export const telemetryStaleAfterMs = TELEMETRY_STALE_MS
