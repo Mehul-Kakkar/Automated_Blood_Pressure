@@ -8,7 +8,7 @@ The separate display remains connected to the main controller over ESP-NOW.
 Wi-Fi/MQTT remains independent of both links. BLE connection state never starts
 or stops measurement by itself.
 
-Advertised device name: Pulsefield BP (included in the BLE scan response)
+Advertised device name: BP Controller (included in the BLE scan response)
 Service: 4b505001-6b70-4c46-9c87-687572617465
 
 Characteristics
@@ -49,10 +49,10 @@ Bluetooth API.
 Phone test guide
 ----------------
 1. Flash the main ESP32-S3 firmware and open its serial monitor. It should log
-   `Phone BLE advertising started: name='Pulsefield BP'` after BLE setup; the
+   `Phone BLE advertising started: name='BP Controller'` after BLE setup; the
    main loop must continue if BLE is absent.
 2. Serve the frontend on HTTPS and open it in Android Chrome. On Device, choose
-   Connect phone over BLE and select Pulsefield BP in the browser chooser.
+   Connect over BLE and select BP Controller in the device chooser.
 3. The page should show connected and display controller state/fault notifications.
    Connection causes only GET_STATUS; it must not start a measurement.
 4. Send GET_STATUS or REQUEST_LIVE_DATA and confirm a matching command ID ack.

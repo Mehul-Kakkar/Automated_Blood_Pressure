@@ -79,9 +79,9 @@ export class PhoneBleClient {
     }
     const info = await this.chars.get('deviceInfo')?.readValue()
     if (info) this.listener?.({ kind: 'deviceInfo', value: JSON.parse(new TextDecoder().decode(info)) as Record<string, unknown> })
-    this.listener?.({ kind: 'connected', value: { name: device.name ?? 'Pulsefield BP' } })
+    this.listener?.({ kind: 'connected', value: { name: device.name ?? 'BP Controller' } })
     void this.send('GET_STATUS').catch(error => this.listener?.({ kind: 'error', value: { message: error instanceof Error ? error.message : 'Could not read controller status.' } }))
-    return device.name ?? 'Pulsefield BP'
+    return device.name ?? 'BP Controller'
   }
 
   private scheduleReconnect() {
