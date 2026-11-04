@@ -465,10 +465,14 @@ static bool readTouchPoint(uint16_t &x, uint16_t &y) {
   const uint16_t rawX = ((xHigh & 0x0F) << 8) | xLow;
   const uint16_t rawY = ((yHigh & 0x0F) << 8) | yLow;
 
-  // FT6336 reports native 240x320 coordinates. Rotation 1 exchanges axes.
+  // FT6336 reports native 240x320 coordinates. Rotation 1 exchanges axes,
+  // and the native X axis is reversed relative to the landscape display Y.
+  if (rawX >= DISPLAY_HEIGHT || rawY >= DISPLAY_WIDTH) {
+    return false;
+  }
   x = rawY;
-  y = rawX;
-  return x < DISPLAY_WIDTH && y < DISPLAY_HEIGHT;
+  y = DISPLAY_HEIGHT - 1 - rawX;
+  return true;
 }
 
 static void readTouch(lv_indev_drv_t *, lv_indev_data_t *data) {
