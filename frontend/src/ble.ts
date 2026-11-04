@@ -35,14 +35,14 @@ export class PhoneBleClient {
   private reconnectTimer?: number
   private disconnected = () => {
     this.server = undefined; this.chars.clear()
-    for (const waiter of this.pending.values()) { window.clearTimeout(waiter.timer); waiter.reject(new Error('Phone BLE disconnected before the controller acknowledged the command.')) }
+    for (const waiter of this.pending.values()) { window.clearTimeout(waiter.timer); waiter.reject(new Error('Device disconnected before the controller acknowledged the command.')) }
     this.pending.clear(); this.listener?.({ kind: 'disconnected', value: {} })
     if (!this.intentionalDisconnect && this.device) this.scheduleReconnect()
   }
 
   async connect(listener: (event: PhoneBleEvent) => void) {
     const bluetooth = (navigator as Navigator & { bluetooth?: BluetoothApi }).bluetooth
-    if (!bluetooth) throw new Error('Bluetooth access is unavailable here. Open this app in Chrome on an Android phone over HTTPS.')
+    if (!bluetooth) throw new Error('Bluetooth access is unavailable here. Open this app in a Web Bluetooth-enabled browser over HTTPS.')
     this.listener = listener
     const device = await bluetooth.requestDevice({ filters: [{ services: [PHONE_BLE.service] }], optionalServices: [PHONE_BLE.service] })
     this.device = device
@@ -101,14 +101,14 @@ export class PhoneBleClient {
     const device = this.device
     device?.gatt?.disconnect(); device?.removeEventListener('gattserverdisconnected', this.disconnected)
     this.device = undefined; this.server = undefined; this.chars.clear()
-    for (const waiter of this.pending.values()) { window.clearTimeout(waiter.timer); waiter.reject(new Error('Phone BLE disconnected before the controller acknowledged the command.')) }
+    for (const waiter of this.pending.values()) { window.clearTimeout(waiter.timer); waiter.reject(new Error('Device disconnected before the controller acknowledged the command.')) }
     this.pending.clear()
   }
   get connected() { return this.server?.connected === true }
 
   async send(command: 'GET_STATUS' | 'START_MEASUREMENT' | 'STOP_MEASUREMENT' | 'REQUEST_LIVE_DATA' | 'GET_DEVICE_INFO') {
     const characteristic = this.chars.get('command')
-    if (!this.connected || !characteristic) throw new Error('Connect to the controller over phone BLE first.')
+    if (!this.connected || !characteristic) throw new Error('Connect to the controller over BLE first.')
     const commandId = crypto.randomUUID()
     const packet = new TextEncoder().encode(JSON.stringify({ v: 1, command_id: commandId, command }))
     const acknowledged = new Promise<void>((resolve, reject) => {

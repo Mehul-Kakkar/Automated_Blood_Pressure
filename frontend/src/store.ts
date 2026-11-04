@@ -10,7 +10,7 @@ type Store = {
   acousticEvents: RemoteAcousticEvent[]; remoteSession?: RemoteSession; devices: Device[]; selectedDeviceId?: string
   startedAt?: number; busy: boolean; error?: string; apiToken?: string; sessionSync: SyncState
   startRequestId?: string
-  bleDeviceName?: string; bleState?: string; blePressureRaw?: number; bleFault?: string; bleError?: string; bleConnectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
+  bleState?: string; blePressureRaw?: number; bleFault?: string; bleError?: string; bleConnectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
   setApiToken: (token?: string) => void; refreshBackend: () => Promise<void>; refreshDevices: () => Promise<void>
   selectDevice: (id: string) => void; loadHistory: (offset?: number) => Promise<void>; refreshRemoteSession: () => Promise<RemoteSession | undefined>
   connect: () => Promise<void>; startFromHome: () => Promise<boolean>; start: () => Promise<void>; stop: () => Promise<void>
@@ -52,7 +52,7 @@ export const useAppStore = create<Store>((set, get) => ({
   demo: initialDemo, connected: false, bleConnected: false, deviceOnline: false, backendAvailable: false, databaseStatus: 'unknown',
   state: 'disconnected', samples: [], sessions: [], remoteSessions: [], acousticEvents: [], devices: [], busy: false,
   sessionSync: initialDemo ? 'not_applicable' : 'uncertain',
-  bleDeviceName: undefined, bleState: undefined, blePressureRaw: undefined, bleFault: undefined, bleError: undefined, bleConnectionState: 'disconnected',
+  bleState: undefined, blePressureRaw: undefined, bleFault: undefined, bleError: undefined, bleConnectionState: 'disconnected',
   setApiToken: token => { const trimmed = token?.trim(); backendApi.setToken(trimmed); set({ apiToken: trimmed || undefined, error: undefined }) },
   refreshBackend: async () => {
     try {
@@ -82,10 +82,10 @@ export const useAppStore = create<Store>((set, get) => ({
   connectPhone: async () => {
     set({ bleError: undefined, busy: true, bleConnectionState: 'connecting' })
     try {
-      const name = await phoneBle.connect((event: PhoneBleEvent) => {
-        if (event.kind === 'connected') set({ bleConnected: true, bleConnectionState: 'connected', bleDeviceName: String(event.value.name ?? 'Pulsefield BP'), bleError: undefined })
+      await phoneBle.connect((event: PhoneBleEvent) => {
+        if (event.kind === 'connected') set({ bleConnected: true, bleConnectionState: 'connected', bleError: undefined })
         else if (event.kind === 'reconnecting') set({ bleConnected: false, bleConnectionState: 'reconnecting' })
-        else if (event.kind === 'disconnected') set({ bleConnected: false, bleConnectionState: 'disconnected', bleDeviceName: undefined })
+        else if (event.kind === 'disconnected') set({ bleConnected: false, bleConnectionState: 'disconnected' })
         else if (event.kind === 'state') {
           const state = String(event.value.state ?? 'unknown')
           set({ bleState: state, bleFault: String(event.value.fault ?? 'none'),
@@ -94,19 +94,19 @@ export const useAppStore = create<Store>((set, get) => ({
             ...(state === 'idle' && get().state === 'disconnected' ? { state: 'connected_idle' as SessionState } : {}) })
         } else if (event.kind === 'pressure') set({ blePressureRaw: typeof event.value.raw_counts === 'number' ? event.value.raw_counts : undefined })
         else if (event.kind === 'fault') set({ bleFault: String(event.value.code ?? 'unknown') })
-        else if (event.kind === 'error') set({ bleError: String(event.value.message ?? 'Phone BLE connection failed.') })
+        else if (event.kind === 'error') set({ bleError: String(event.value.message ?? 'Device connection failed.') })
       })
-      set({ bleConnected: true, bleConnectionState: 'connected', bleDeviceName: name })
+      set({ bleConnected: true, bleConnectionState: 'connected' })
     } catch (error) {
       phoneBle.disconnect()
-      set({ bleConnected: false, bleConnectionState: 'disconnected', bleError: errorMessage(error, 'Phone BLE connection failed.') })
+      set({ bleConnected: false, bleConnectionState: 'disconnected', bleError: errorMessage(error, 'Device connection failed.') })
       throw error
     } finally { set({ busy: false }) }
   },
-  disconnectPhone: () => { phoneBle.disconnect(); set({ bleConnected: false, bleConnectionState: 'disconnected', bleDeviceName: undefined }) },
+  disconnectPhone: () => { phoneBle.disconnect(); set({ bleConnected: false, bleConnectionState: 'disconnected' }) },
   sendPhoneCommand: async command => {
     try { await phoneBle.send(command); set({ bleError: undefined }) }
-    catch (error) { set({ bleError: errorMessage(error, 'Phone BLE command failed.') }); throw error }
+    catch (error) { set({ bleError: errorMessage(error, 'Device command failed.') }); throw error }
   },
   selectDevice: id => { const device = get().devices.find(item => item.id === id); set({ selectedDeviceId: id, deviceOnline: device?.online === true, connected: device?.online === true, state: device?.online && device.reported_state === 'idle' ? 'connected_idle' : 'disconnected' }) },
   loadHistory: async (offset = 0) => {
@@ -164,7 +164,7 @@ export const useAppStore = create<Store>((set, get) => ({
     if (current.bleConnected && (!current.apiToken || !current.backendAvailable || !current.deviceOnline)) {
       set({ busy: true, error: undefined })
       try { await get().sendPhoneCommand('START_MEASUREMENT'); return get().bleState === 'measuring' }
-      catch (e) { set({ state: get().bleState === 'fault' ? 'device_fault' : 'error', error: errorMessage(e, 'The device rejected Start over phone BLE.') }); return false }
+      catch (e) { set({ state: get().bleState === 'fault' ? 'device_fault' : 'error', error: errorMessage(e, 'The device rejected Start over BLE.') }); return false }
       finally { set({ busy: false }) }
     }
     set({ busy: true, error: undefined, state: 'connecting', sessionSync: 'pending', samples: [], acousticEvents: [], remoteSession: undefined })
@@ -237,7 +237,7 @@ export const useAppStore = create<Store>((set, get) => ({
     if (current.bleConnected && (!current.remoteSession || !current.apiToken || !current.backendAvailable)) {
       set({ state: 'stopping', busy: true, error: undefined })
       try { await get().sendPhoneCommand('STOP_MEASUREMENT'); set({ busy: false, state: 'uncertain', error: 'The controller acknowledged Stop, but its local state must confirm safe release.' }) }
-      catch (e) { set({ state: 'uncertain', busy: false, error: errorMessage(e, 'Stop was not confirmed over phone BLE.') }) }
+      catch (e) { set({ state: 'uncertain', busy: false, error: errorMessage(e, 'Stop was not confirmed over BLE.') }) }
       return
     }
     const sessionId = current.remoteSession?.id
