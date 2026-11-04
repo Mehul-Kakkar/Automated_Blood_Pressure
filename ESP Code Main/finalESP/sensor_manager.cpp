@@ -4,23 +4,35 @@
 #include "device_state.h"
 #include "pressure_manager.h"
 #include <freertos/queue.h>
+#include <HX710B.h>
+#include <freertos/task.h>
 
 namespace {
 QueueHandle_t samples=nullptr;
 KorotkoffDetector detector;
 float previousInput=0.0f,highPassOutput=0.0f,lowPassOutput=0.0f;
 constexpr float HP_ALPHA=0.9409f,LP_ALPHA=0.4852f;
-uint32_t lost=0,lastPressurePoll=0,sampleCount=0;
+uint32_t lost=0,sampleCount=0;
+HX710B pressureAdc(PRESSURE_CLOCK_PIN,PRESSURE_DATA_PIN,HX710B_DIFF1);
+bool pressureTaskStarted=false;
 
 bool readHx710bIfReady(int32_t& raw){
-  // Never wait for DOUT. A not-ready conversion is skipped so the microphone
-  // loop cannot stall while awaiting the pressure converter.
-  if(digitalRead(PRESSURE_DATA_PIN)!=LOW)return false;
-  uint32_t value=0;
-  for(uint8_t bit=0;bit<24;bit++){digitalWrite(PRESSURE_CLOCK_PIN,HIGH);delayMicroseconds(1);value=(value<<1)|(digitalRead(PRESSURE_DATA_PIN)?1UL:0UL);digitalWrite(PRESSURE_CLOCK_PIN,LOW);delayMicroseconds(1);}
-  // Existing HX710B sketch uses the 25th pulse (Channel A, gain 128).
-  digitalWrite(PRESSURE_CLOCK_PIN,HIGH);delayMicroseconds(1);digitalWrite(PRESSURE_CLOCK_PIN,LOW);delayMicroseconds(1);
-  if(value&0x800000UL)value|=0xFF000000UL;raw=(int32_t)value;return true;
+  // Called only by pressureTask, never by the microphone acquisition loop.
+  uint32_t libraryRaw=0;
+  // This installed library uses read(data, timeoutMs) and returns HX710B_OK.
+  // A zero timeout bounds each readiness check; a missed conversion is retried.
+  if(pressureAdc.read(&libraryRaw,0)!=HX710B_OK)return false;
+  if(libraryRaw==0||libraryRaw==0xFFFFFFUL)return false; // reject saturation endpoints
+  uint32_t twosComplement=libraryRaw^0x800000UL; // undo the library's offset-binary transform
+  if(twosComplement&0x800000UL)twosComplement|=0xFF000000UL;
+  raw=(int32_t)twosComplement;
+  return true;
+}
+void pressureTask(void*){
+  // This library initializes the converter and waits briefly for startup; keep
+  // that work outside the time-sensitive microphone acquisition loop.
+  pressureAdc.init();
+  for(;;){int32_t raw=0;uint32_t now=millis();bool ready=readHx710bIfReady(raw);pressureManagerRecord(ready,raw,now);vTaskDelay(pdMS_TO_TICKS(5));}
 }
 uint32_t nextSampleUs=0;bool eventSinceTelemetry=false;
 void acquireOne(){
@@ -32,15 +44,15 @@ void acquireOne(){
     lowPassOutput+=LP_ALPHA*(highPassOutput-lowPassOutput);
     uint32_t nowMs=millis();bool event=detector.process(lowPassOutput,nowMs);eventSinceTelemetry|=event;
     SensorSample sample{};sample.timestampMs=nowMs;sample.microphoneRaw=raw;sample.filtered=lowPassOutput;sample.envelope=detector.envelope;sample.noiseFloor=detector.noiseFloor;sample.threshold=fmaxf(detector.thresholdFloor,detector.noiseFloor*detector.thresholdMultiplier);sample.eventDetected=eventSinceTelemetry;
-    if((uint32_t)(nowMs-lastPressurePoll)>=PRESSURE_POLL_INTERVAL_MS){lastPressurePoll=nowMs;sample.pressureReady=readHx710bIfReady(sample.pressureRaw);pressureManagerRecord(sample.pressureReady,sample.pressureRaw,nowMs);}
+    sample.pressureReady=pressureSensorConnected(nowMs);if(sample.pressureReady)sample.pressureRaw=latestPressureRaw();
     sampleCount++;
     // Store a compact downsample at 10 Hz; raw acoustic data is never streamed
     // continuously. A latched event flag is carried into the next batch sample.
     if(sampleCount%200==0){DeviceState current=deviceStateSnapshot();if(current.state==MeasurementState::MEASURING||current.state==MeasurementState::DEFLATING){if(xQueueSend(samples,&sample,0)!=pdTRUE)lost++;else eventSinceTelemetry=false;}}
   }
 }
-void sensorManagerBegin(){pinMode(MIC_PIN,INPUT);pinMode(PRESSURE_DATA_PIN,INPUT);pinMode(PRESSURE_CLOCK_PIN,OUTPUT);digitalWrite(PRESSURE_CLOCK_PIN,LOW);analogReadResolution(12);analogSetPinAttenuation(MIC_PIN,ADC_11db);detector.reset();samples=xQueueCreate(TELEMETRY_QUEUE_CAPACITY,sizeof(SensorSample));nextSampleUs=micros();}
+void sensorManagerBegin(){pinMode(MIC_PIN,INPUT);analogReadResolution(12);analogSetPinAttenuation(MIC_PIN,ADC_11db);detector.reset();samples=xQueueCreate(TELEMETRY_QUEUE_CAPACITY,sizeof(SensorSample));nextSampleUs=micros();pressureTaskStarted=xTaskCreatePinnedToCore(pressureTask,"hx710b-read",3072,nullptr,1,nullptr,0)==pdPASS;}
 void sensorManagerPoll(){acquireOne();}
-bool sensorManagerReady(){return samples!=nullptr;}
+bool sensorManagerReady(){return samples!=nullptr&&pressureTaskStarted;}
 QueueHandle_t sensorSampleQueue(){return samples;}
 uint32_t sensorDroppedCount(){return lost;}

@@ -2,7 +2,7 @@
 
 // Phone BLE GATT protocol, version 1. Keep in sync with frontend/src/ble.ts.
 namespace PhoneBle {
-constexpr char DEVICE_NAME[] = "BP Controller";
+constexpr char DEVICE_NAME[] = "Pulsefield BP";
 constexpr char SERVICE_UUID[] = "4b505001-6b70-4c46-9c87-687572617465";
 constexpr char DEVICE_INFO_UUID[] = "4b505002-6b70-4c46-9c87-687572617465";
 constexpr char STATE_UUID[] = "4b505003-6b70-4c46-9c87-687572617465";

@@ -11,6 +11,7 @@ struct DeviceState {
   FaultCode fault=FaultCode::NONE;
   uint32_t uptimeMs=0,statusSequence=0,lostSamples=0,sampleSequence=0;
   int32_t pressureRaw=0;
+  float pressureMmhg=0.0f;
   bool pressureAvailable=false,microphoneAvailable=true;
   bool pressureMmhgAvailable=false;
   char sessionId[37]={0};

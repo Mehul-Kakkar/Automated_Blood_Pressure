@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <math.h>
 
 // Values come from the existing test sketches. Those sketches assign GPIO4
 // to both MIC_PIN and PUMP_IN2_PIN. Do not enable actuators until the physical
@@ -10,8 +11,11 @@ constexpr uint8_t PUMP_IN1_PIN=5, PUMP_IN2_PIN=4, PUMP_ENABLE_PIN=15;
 constexpr uint8_t VALVE_IN1_PIN=6, VALVE_IN2_PIN=7, VALVE_ENABLE_PIN=16;
 constexpr uint32_t SENSOR_SAMPLE_RATE_HZ=2000;
 constexpr uint32_t SENSOR_SAMPLE_INTERVAL_US=1000000UL/SENSOR_SAMPLE_RATE_HZ;
-constexpr uint32_t PRESSURE_POLL_INTERVAL_MS=100;
-constexpr uint32_t HX710B_READY_TIMEOUT_US=50000;
+// Rough prototype conversion supplied by the operator. This produces an
+// estimate only; it is not a validated calibration and never unlocks actuators.
+constexpr float PRESSURE_COUNTS_PER_MMHG=2.67f;
+constexpr int32_t PRESSURE_ZERO_OFFSET_COUNTS=1000000;
+constexpr bool PRESSURE_CALIBRATION_CONFIGURED=true;
 constexpr uint32_t PUMP_MAX_RUNTIME_MS=120000; // bench sketch limit, not a clinical pressure limit
 constexpr uint32_t MAX_TELEMETRY_BATCH_SAMPLES=12;
 constexpr uint32_t TELEMETRY_QUEUE_CAPACITY=64;

@@ -2,5 +2,8 @@ Required Arduino libraries:
 - PubSubClient 2.8.x (TLS transport supplied by ESP32 WiFiClientSecure)
 - ArduinoJson 6.21.x
 - Arduino-ESP32 core 3.x built-in BLE library (BLEDevice/BLEServer/BLE2902)
+- hx710b_arduino 1.0.0 by Andhie Setyabudi
+  (HX710B.h; constructor, init(), read(uint32_t*, timeout), HX710B_OK)
+  https://github.com/andhieSetyabudi/hx710b_arduino
 
 Required platform: Arduino-ESP32 core 3.x for the ESP-NOW receive callback API used here.
