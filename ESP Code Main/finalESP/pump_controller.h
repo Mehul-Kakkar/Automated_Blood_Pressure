@@ -5,4 +5,5 @@ bool pumpStart(uint32_t nowMs);
 void pumpStop();
 bool pumpTimedOut(uint32_t nowMs);
 void valveDeenergize();
+void valveEnergizeForInflation();
 bool valveRequestVerifiedRelease();

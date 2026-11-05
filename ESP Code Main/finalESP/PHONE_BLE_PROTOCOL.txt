@@ -56,12 +56,12 @@ Phone test guide
 3. The page should show connected and display controller state/fault notifications.
    Connection causes only GET_STATUS; it must not start a measurement.
 4. Send GET_STATUS or REQUEST_LIVE_DATA and confirm a matching command ID ack.
-5. Press Start measurement explicitly. With the current unverified calibration,
-   pin map and valve behavior, expect a safety rejection. A successful GATT write
-   is not evidence that a measurement started.
-6. STOP_MEASUREMENT is accepted only through the local command manager. Stop
-   cannot claim safe cuff release until the valve behavior and pressure endpoint
-   are verified.
+5. Press Start measurement explicitly. The controller closes the normally-open
+   release valve, inflates to 130 mmHg, then cuts pump power and deenergizes the
+   valve so cuff pressure falls. A successful GATT write alone is not evidence
+   that a measurement started; confirm the resulting state notification.
+6. STOP_MEASUREMENT is handled by the local command manager; it cuts pump power
+   and deenergizes the valve to release cuff pressure.
 7. Disconnect the phone during operation. Local sensor polling and safety code
    must continue. Reconnect and verify the UI requests fresh status; old START
    requests are never replayed.

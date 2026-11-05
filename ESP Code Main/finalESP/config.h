@@ -2,9 +2,7 @@
 #include <Arduino.h>
 #include <math.h>
 
-// Values come from the existing test sketches. Those sketches assign GPIO4
-// to both MIC_PIN and PUMP_IN2_PIN. Do not enable actuators until the physical
-// harness is checked and the pin conflict is resolved.
+// GPIO4 is pump IN2; microphone input uses GPIO10.
 constexpr uint8_t MIC_PIN=10;
 constexpr uint8_t PRESSURE_DATA_PIN=8, PRESSURE_CLOCK_PIN=9;
 constexpr uint8_t PUMP_IN1_PIN=5, PUMP_IN2_PIN=4, PUMP_ENABLE_PIN=15;
@@ -28,9 +26,8 @@ constexpr uint16_t ESP_NOW_PROTOCOL_VERSION=1; // legacy test packet layout
 constexpr char FIRMWARE_VERSION[]="1.0.0-safe";
 constexpr char PROCESSING_ALGORITHM_VERSION[]="korotkoff-existing-1";
 
-// Do not change these based on raw-count observations. These require reviewed
-// calibration/wiring records and verified valve behavior.
+// Confirmed pump and normally-open valve behavior; energizing closes the valve.
 constexpr bool PRESSURE_CALIBRATION_CONFIRMED=true;
-constexpr bool ACTUATOR_PINMAP_CONFIRMED=false;
-constexpr bool VALVE_RELEASE_BEHAVIOR_CONFIRMED=false;
-constexpr bool AUTOMATIC_INFLATION_ENABLED=false;
+constexpr bool ACTUATOR_PINMAP_CONFIRMED=true;
+constexpr bool VALVE_RELEASE_BEHAVIOR_CONFIRMED=true;
+constexpr bool AUTOMATIC_INFLATION_ENABLED=true;
