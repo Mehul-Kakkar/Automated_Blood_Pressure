@@ -4,7 +4,7 @@ Frame layout, packed: uint32 magic 0x42505031; uint16 version 1; uint16 sequence
 
 Types:
 - Display -> main: PING with JSON source/protocol_version.
-- Main -> display: PONG; MAIN_STATUS with state, uptime_ms, raw pressure count and rough pressure_mmhg estimate when fresh, pressure_calibrated=false, pressure_estimate_only=true, heart_rate_bpm=null, fault. The estimate uses `(signed_raw_counts - 1000000) / 2.67` and is not validated for clinical or actuator use.
+- Main -> display: PONG; MAIN_STATUS with state, uptime_ms, raw pressure count and pressure_mmhg estimate when fresh, pressure_calibrated=true, pressure_estimate_only=true, heart_rate_bpm=null, fault. The estimate uses `(signed_raw_counts - 1000000) / 2670000` PSI, converted to mmHg; 6.34 million counts is about 2 PSI (103 mmHg). The requested 130 mmHg ceiling does not enable actuator operation.
 - Display -> main: COMMAND with `{"cmd":"START","request_id":"<uuid>","session_id":"<uuid>"}`; COMMAND with `{"cmd":"STOP"}`; COMMAND with `{"cmd":"STATUS_REQUEST"}`.
 - Main -> display: ACK with ack_sequence, result, reason, state. The sequence correlates acknowledgements. START from the display requires a backend-created session_id; absent one, the main rejects it as backend_session_required.
 

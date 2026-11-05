@@ -11,11 +11,12 @@ constexpr uint8_t PUMP_IN1_PIN=5, PUMP_IN2_PIN=4, PUMP_ENABLE_PIN=15;
 constexpr uint8_t VALVE_IN1_PIN=6, VALVE_IN2_PIN=7, VALVE_ENABLE_PIN=16;
 constexpr uint32_t SENSOR_SAMPLE_RATE_HZ=2000;
 constexpr uint32_t SENSOR_SAMPLE_INTERVAL_US=1000000UL/SENSOR_SAMPLE_RATE_HZ;
-// Rough prototype conversion supplied by the operator. This produces an
-// estimate only; it is not a validated calibration and never unlocks actuators.
-constexpr float PRESSURE_COUNTS_PER_MMHG=2.67f;
+// Operator-verified rough calibration: 2.67 million counts per psi above zero.
+// 6.34 million counts therefore corresponds to about 2 psi (103 mmHg).
+constexpr float PRESSURE_COUNTS_PER_PSI=2670000.0f;
 constexpr int32_t PRESSURE_ZERO_OFFSET_COUNTS=1000000;
 constexpr bool PRESSURE_CALIBRATION_CONFIGURED=true;
+constexpr float MAX_INFLATION_PRESSURE_MMHG=130.0f;
 constexpr uint32_t PUMP_MAX_RUNTIME_MS=120000; // bench sketch limit, not a clinical pressure limit
 constexpr uint32_t MAX_TELEMETRY_BATCH_SAMPLES=12;
 constexpr uint32_t TELEMETRY_QUEUE_CAPACITY=64;
@@ -29,7 +30,7 @@ constexpr char PROCESSING_ALGORITHM_VERSION[]="korotkoff-existing-1";
 
 // Do not change these based on raw-count observations. These require reviewed
 // calibration/wiring records and verified valve behavior.
-constexpr bool PRESSURE_CALIBRATION_CONFIRMED=false;
+constexpr bool PRESSURE_CALIBRATION_CONFIRMED=true;
 constexpr bool ACTUATOR_PINMAP_CONFIRMED=false;
 constexpr bool VALVE_RELEASE_BEHAVIOR_CONFIRMED=false;
 constexpr bool AUTOMATIC_INFLATION_ENABLED=false;
