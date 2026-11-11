@@ -63,4 +63,4 @@ void bleManagerPoll(){Request r{};while(requests&&xQueueReceive(requests,&r,0)==
   if(advertisingRestartPending&&server){advertisingRestartPending=false;server->startAdvertising();}
   uint32_t now=millis();if(connected&&(uint32_t)(now-lastUpdate)>=500){lastUpdate=now;publishSnapshot();}
 }
-void bleManagerPublishCommandResult(const CommandResult& result){if(result.origin!=CommandOrigin::BLE_PHONE)return;response(result.commandId,!strcmp(result.status,"completed"),result.reasonCode[0]?result.reasonCode:"command_rejected");publishSnapshot();}
+void bleManagerPublishCommandResult(const CommandResult& result){if(result.origin!=CommandOrigin::BLE_PHONE)return;const bool accepted=!strcmp(result.status,"accepted")||!strcmp(result.status,"completed");response(result.commandId,accepted,result.reasonCode[0]?result.reasonCode:"command_rejected");publishSnapshot();}

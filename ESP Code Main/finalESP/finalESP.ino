@@ -26,7 +26,8 @@ void setup(){
   bleManagerBegin();
   if(!sessionManagerReady()||!sensorManagerReady()){xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.state=MeasurementState::FAULT;deviceState.fault=FaultCode::COMMAND_QUEUE_FULL;xSemaphoreGive(deviceStateMutex);Serial.println("Queue allocation failed; remote measurement commands remain disabled.");return;}
   mqttManagerBegin();
-  Serial.println("IntegratedController: pressure-controlled inflation enabled; normally-open release valve opens at 130 mmHg.");
+  if(TIMED_PUMP_TEST_MODE)Serial.printf("IntegratedController: TIMED ACOUSTIC TEST enabled; pump=%lu ms, then normally-open valve releases; pressure feedback bypassed.\n",(unsigned long)TIMED_PUMP_TEST_DURATION_MS);
+  else Serial.println("IntegratedController: pressure-controlled inflation enabled; normally-open release valve opens at 130 mmHg.");
 }
 
 void loop(){
@@ -34,14 +35,21 @@ void loop(){
   sensorManagerPoll();sessionManagerPoll();bleManagerPoll();const uint32_t now=millis();
   bool pressureConnected=pressureSensorConnected(now);xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.uptimeMs=now;deviceState.pressureAvailable=pressureConnected;deviceState.pressureMmhgAvailable=pressureConnected&&pressureMmHgAvailable();xSemaphoreGive(deviceStateMutex);
   DeviceState s=deviceStateSnapshot();
-  if(measurementActive(s.state)&&!pressureSensorConnected(now)){
+  // A sensor disconnect is recoverable once fresh HX710B conversions resume.
+  // All actuator paths already stop the pump and release the normally-open valve.
+  if(s.state==MeasurementState::FAULT&&s.fault==FaultCode::SENSOR_DISCONNECTED&&pressureConnected){
+    xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.state=MeasurementState::IDLE;deviceState.fault=FaultCode::NONE;xSemaphoreGive(deviceStateMutex);s=deviceStateSnapshot();
+  }
+  if(measurementActive(s.state)&&!pressureSensorConnected(now)&&!s.timedPumpTest){
     FaultCode stopFault=safetyEmergencyStop();xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.state=MeasurementState::FAULT;deviceState.fault=stopFault==FaultCode::NONE?FaultCode::SENSOR_DISCONNECTED:stopFault;xSemaphoreGive(deviceStateMutex);
-  } else if(s.state==MeasurementState::INFLATING&&s.pressureMmhg>=MAX_INFLATION_PRESSURE_MMHG){
+  } else if(s.state==MeasurementState::INFLATING&&!s.timedPumpTest&&s.pressureMmhg>=MAX_INFLATION_PRESSURE_MMHG){
     // Stop pump first, then deenergize the normally-open valve to release cuff pressure.
     pumpStop();const bool released=valveRequestVerifiedRelease();xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.state=released?MeasurementState::DEFLATING:MeasurementState::FAULT;deviceState.fault=released?FaultCode::NONE:FaultCode::STOP_RELEASE_UNVERIFIED;xSemaphoreGive(deviceStateMutex);
   } else if(s.state==MeasurementState::INFLATING&&pumpTimedOut(now)){
-    const FaultCode releaseFault=valveRequestVerifiedRelease()?FaultCode::NONE:FaultCode::STOP_RELEASE_UNVERIFIED;xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.state=MeasurementState::FAULT;deviceState.fault=releaseFault==FaultCode::NONE?FaultCode::INFLATION_TIMEOUT:releaseFault;xSemaphoreGive(deviceStateMutex);
-  } else if(s.state==MeasurementState::DEFLATING&&s.pressureMmhg<=0.0f){
+    const FaultCode releaseFault=valveRequestVerifiedRelease()?FaultCode::NONE:FaultCode::STOP_RELEASE_UNVERIFIED;xSemaphoreTake(deviceStateMutex,portMAX_DELAY);if(s.timedPumpTest&&releaseFault==FaultCode::NONE){deviceState.state=MeasurementState::DEFLATING;deviceState.fault=FaultCode::NONE;deviceState.timedTestReleaseStartedAtMs=now;}else{deviceState.state=MeasurementState::FAULT;deviceState.fault=releaseFault==FaultCode::NONE?FaultCode::INFLATION_TIMEOUT:releaseFault;deviceState.timedPumpTest=false;}xSemaphoreGive(deviceStateMutex);
+  } else if(s.state==MeasurementState::DEFLATING&&s.timedPumpTest&&s.timedTestReleaseStartedAtMs&&(uint32_t)(now-s.timedTestReleaseStartedAtMs)>=TIMED_PUMP_TEST_CAPTURE_MS){
+    xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.state=MeasurementState::COMPLETED;deviceState.fault=FaultCode::NONE;deviceState.timedPumpTest=false;deviceState.timedTestReleaseStartedAtMs=0;xSemaphoreGive(deviceStateMutex);
+  } else if(s.state==MeasurementState::DEFLATING&&!s.timedPumpTest&&s.pressureMmhg<=0.0f){
     xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.state=MeasurementState::COMPLETED;deviceState.fault=FaultCode::NONE;xSemaphoreGive(deviceStateMutex);
   }
   if((uint32_t)(now-lastDisplayStatus)>=1000){lastDisplayStatus=now;publishLocalStatus();}

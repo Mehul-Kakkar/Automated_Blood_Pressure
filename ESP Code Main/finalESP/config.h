@@ -16,6 +16,15 @@ constexpr int32_t PRESSURE_ZERO_OFFSET_COUNTS=1000000;
 constexpr bool PRESSURE_CALIBRATION_CONFIGURED=true;
 constexpr float MAX_INFLATION_PRESSURE_MMHG=130.0f;
 constexpr uint32_t PUMP_MAX_RUNTIME_MS=120000; // bench sketch limit, not a clinical pressure limit
+// Temporary acoustic test mode: pump for a configured fixed interval without
+// requiring pressure readings, then release and keep recording microphone
+// samples for the configured capture window. Set false to restore pressure mode.
+constexpr bool TIMED_PUMP_TEST_MODE=true;
+constexpr uint32_t TIMED_PUMP_TEST_DURATION_MS=1000;
+constexpr uint32_t TIMED_PUMP_TEST_MAX_DURATION_MS=5000;
+constexpr uint32_t TIMED_PUMP_TEST_CAPTURE_MS=15000;
+static_assert(TIMED_PUMP_TEST_DURATION_MS>0 && TIMED_PUMP_TEST_DURATION_MS<=TIMED_PUMP_TEST_MAX_DURATION_MS,
+              "Timed pump duration must be between 1 ms and the hard maximum.");
 constexpr uint32_t MAX_TELEMETRY_BATCH_SAMPLES=12;
 constexpr uint32_t TELEMETRY_QUEUE_CAPACITY=64;
 constexpr uint32_t COMMAND_QUEUE_CAPACITY=8;
