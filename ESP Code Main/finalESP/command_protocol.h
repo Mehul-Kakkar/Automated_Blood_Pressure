@@ -1,6 +1,6 @@
 #pragma once
 #include <Arduino.h>
-enum class CommandKind:uint8_t { START,STOP,STATUS_REQUEST };
+enum class CommandKind:uint8_t { START,STOP,STATUS_REQUEST,RESET_FAULT };
 enum class CommandOrigin:uint8_t { MQTT,ESP_NOW_DISPLAY,BLE_PHONE };
 struct ControllerCommand {
   CommandKind kind;

@@ -1,3 +1,4 @@
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -58,9 +59,9 @@ def test_expired_and_valid_credentials_are_handled(db_session) -> None:
     owner = Owner(username="expiry_user", display_name="Expiry", password_hash=hash_password("correct horse battery staple"))
     db_session.add(owner)
     db_session.flush()
-    expired = OwnerCredential(owner_username=owner.username, token_sha256="1" * 64,
+    expired = OwnerCredential(owner_username=owner.username, token_sha256=hashlib.sha256(b"expired-token").hexdigest(),
                               expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
-    valid = OwnerCredential(owner_username=owner.username, token_sha256="2" * 64,
+    valid = OwnerCredential(owner_username=owner.username, token_sha256=hashlib.sha256(b"valid-token").hexdigest(),
                             expires_at=datetime.now(timezone.utc) + timedelta(minutes=5))
     db_session.add_all([expired, valid])
     db_session.commit()

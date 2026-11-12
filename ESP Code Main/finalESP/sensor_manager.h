@@ -5,7 +5,7 @@
 struct SensorSample {
   uint32_t timestampMs;
   uint16_t microphoneRaw;
-  float filtered,envelope,noiseFloor,threshold;
+  float filtered,envelope,noiseFloor,threshold,pressureMmhg;
   int32_t pressureRaw;
   bool eventDetected,pressureReady;
 };
@@ -14,3 +14,4 @@ void sensorManagerPoll();
 bool sensorManagerReady();
 QueueHandle_t sensorSampleQueue();
 uint32_t sensorDroppedCount();
+bool sensorManagerLatestSample(SensorSample& sample);

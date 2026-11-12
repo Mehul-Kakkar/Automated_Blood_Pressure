@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { ApiError, backendApi, type Device, type RemoteAcousticEvent, type RemoteSample, type RemoteSession } from './api'
-import { DemoDevice, type Session, type SessionState, type Telemetry } from './domain'
+import { DemoDevice, TelemetrySchema, type Session, type SessionState, type Telemetry } from './domain'
 import { phoneBle, type PhoneBleEvent } from './ble'
 
 type SyncState = 'not_applicable' | 'pending' | 'synced' | 'uncertain'
@@ -8,13 +8,13 @@ type Store = {
   demo: boolean; connected: boolean; bleConnected: boolean; deviceOnline: boolean; backendAvailable: boolean; databaseStatus: string
   state: SessionState; samples: Telemetry[]; sessions: Session[]; remoteSessions: RemoteSession[]
   acousticEvents: RemoteAcousticEvent[]; remoteSession?: RemoteSession; devices: Device[]; selectedDeviceId?: string
-  startedAt?: number; busy: boolean; error?: string; apiToken?: string; sessionSync: SyncState
+  startedAt?: number; endedAt?: number; busy: boolean; error?: string; apiToken?: string; sessionSync: SyncState
   startRequestId?: string
-  bleState?: string; blePressureRaw?: number; bleFault?: string; bleError?: string; bleConnectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
+  bleState?: string; blePressureRaw?: number; blePressureMmHg?: number; blePressureSamples: Telemetry[]; bleMicSamples: Telemetry[]; activeBleSessionId?: string; bleFault?: string; bleError?: string; bleConnectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
   setApiToken: (token?: string) => void; refreshBackend: () => Promise<void>; refreshDevices: () => Promise<void>
   selectDevice: (id: string) => void; loadHistory: (offset?: number) => Promise<void>; refreshRemoteSession: () => Promise<RemoteSession | undefined>
   connect: () => Promise<void>; startFromHome: () => Promise<boolean>; start: () => Promise<void>; stop: () => Promise<void>
-  connectPhone: () => Promise<void>; disconnectPhone: () => void; sendPhoneCommand: (command: 'GET_STATUS' | 'START_MEASUREMENT' | 'STOP_MEASUREMENT' | 'REQUEST_LIVE_DATA' | 'GET_DEVICE_INFO') => Promise<void>
+  connectPhone: () => Promise<void>; disconnectPhone: () => void; sendPhoneCommand: (command: 'GET_STATUS' | 'START_MEASUREMENT' | 'STOP_MEASUREMENT' | 'RESET_FAULT' | 'REQUEST_LIVE_DATA' | 'GET_DEVICE_INFO') => Promise<void>; resetDeviceFault: () => Promise<void>
   resetSession: () => void; addSample: (sample: Telemetry) => void; clearError: () => void; setDemo: (value: boolean) => void
   simulateDisconnect: () => void; simulateFault: () => void; appendRemoteSamples: (samples: RemoteSample[], events: RemoteAcousticEvent[]) => void
 }
@@ -28,6 +28,24 @@ const CONFIRM_TIMEOUT_MS = 20000
 const POLL_INTERVAL_MS = 800
 const MAX_BUFFERED_SAMPLES = 120
 const TELEMETRY_STALE_MS = 15000
+const BLE_SESSION_STORAGE_KEY = 'pulsefield.ble.sessions.v1'
+
+function loadBleSessions(): Session[] {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(BLE_SESSION_STORAGE_KEY) ?? '[]')
+    if (!Array.isArray(value)) return []
+    return value.filter((item): item is Session => item && item.source === 'ble' && typeof item.id === 'string' &&
+      typeof item.startedAt === 'number' && typeof item.endedAt === 'number' &&
+      ['completed', 'incomplete'].includes(item.state) && Array.isArray(item.samples) &&
+      item.samples.every((sample: unknown) => TelemetrySchema.safeParse(sample).success)).slice(0, 8)
+  } catch { return [] }
+}
+
+function persistBleSession(session: Session, existing: Session[]): Session[] {
+  const sessions = [session, ...existing.filter(item => item.id !== session.id)].slice(0, 8)
+  try { localStorage.setItem(BLE_SESSION_STORAGE_KEY, JSON.stringify(sessions)) } catch { /* keep this session available in memory */ }
+  return sessions
+}
 
 function errorMessage(error: unknown, fallback: string): string {
   if (error instanceof ApiError) return error.message
@@ -41,8 +59,10 @@ function toTelemetry(row: RemoteSample): Telemetry {
     ...(row.sequence != null ? { sequence: row.sequence } : {}),
     valid: row.is_valid,
     qualityFlags: row.quality_flags,
+    ...(row.event_detected != null ? { eventDetected: row.event_detected } : {}),
     ...(row.is_valid && row.heart_rate_bpm != null ? { heartRateBpm: row.heart_rate_bpm } : {}),
     ...(row.is_valid && row.cuff_pressure_mmhg != null && row.pressure_calibration_version ? { cuffPressureMmHg: row.cuff_pressure_mmhg } : {}),
+    ...(row.processed_signal.filtered != null ? { microphoneFiltered: row.processed_signal.filtered } : {}),
     ...(row.processed_signal.envelope != null ? { acousticEnvelope: row.processed_signal.envelope } : {}),
     deviceState: 'measuring',
   }
@@ -50,9 +70,9 @@ function toTelemetry(row: RemoteSample): Telemetry {
 
 export const useAppStore = create<Store>((set, get) => ({
   demo: initialDemo, connected: false, bleConnected: false, deviceOnline: false, backendAvailable: false, databaseStatus: 'unknown',
-  state: 'disconnected', samples: [], sessions: [], remoteSessions: [], acousticEvents: [], devices: [], busy: false,
+  state: 'disconnected', samples: [], sessions: loadBleSessions(), remoteSessions: [], acousticEvents: [], devices: [], busy: false,
   sessionSync: initialDemo ? 'not_applicable' : 'uncertain',
-  bleState: undefined, blePressureRaw: undefined, bleFault: undefined, bleError: undefined, bleConnectionState: 'disconnected',
+  bleState: undefined, blePressureRaw: undefined, blePressureMmHg: undefined, blePressureSamples: [], bleMicSamples: [], bleFault: undefined, bleError: undefined, bleConnectionState: 'disconnected',
   setApiToken: token => { const trimmed = token?.trim(); backendApi.setToken(trimmed); set({ apiToken: trimmed || undefined, error: undefined }) },
   refreshBackend: async () => {
     try {
@@ -88,11 +108,47 @@ export const useAppStore = create<Store>((set, get) => ({
         else if (event.kind === 'disconnected') set({ bleConnected: false, bleConnectionState: 'disconnected' })
         else if (event.kind === 'state') {
           const state = String(event.value.state ?? 'unknown')
-          set({ bleState: state, bleFault: String(event.value.fault ?? 'none'),
-            ...(state === 'measuring' || state === 'inflating' || state === 'deflating' ? { state: 'measuring' as SessionState } : {}),
+          const fault = String(event.value.fault ?? 'none')
+          const active = ['measuring', 'inflating', 'deflating'].includes(state)
+          const wasActive = ['starting', 'measuring', 'stopping'].includes(get().state)
+          set({ bleState: state, bleFault: fault,
+            ...(state === 'measuring' || state === 'inflating' ? { state: 'measuring' as SessionState } : {}),
+            ...(state === 'deflating' ? { state: (get().state === 'stopping' ? 'stopping' : 'measuring') as SessionState } : {}),
             ...(state === 'fault' || state === 'emergency_stop' ? { state: 'device_fault' as SessionState } : {}),
-            ...(state === 'idle' && get().state === 'disconnected' ? { state: 'connected_idle' as SessionState } : {}) })
-        } else if (event.kind === 'pressure') set({ blePressureRaw: typeof event.value.raw_counts === 'number' ? event.value.raw_counts : undefined })
+            ...(state === 'completed' && wasActive ? { state: 'completed' as SessionState, endedAt: Date.now() } : {}),
+            ...(active && !get().startedAt ? { startedAt: Date.now() } : {}),
+            ...(state === 'idle' && (get().state === 'disconnected' || (get().state === 'device_fault' && fault === 'none')) ? { state: 'connected_idle' as SessionState, startedAt: undefined, endedAt: undefined, activeBleSessionId: undefined } : {}) })
+          if (state === 'completed' && wasActive && get().activeBleSessionId && get().startedAt) {
+            const endedAt = Date.now(); const current = get()
+            const session: Session = { id: current.activeBleSessionId!, startedAt: current.startedAt!, endedAt, state: 'completed', source: 'ble', samples: current.bleMicSamples.slice(-1200) }
+            set({ endedAt, sessions: persistBleSession(session, current.sessions), activeBleSessionId: undefined })
+          }
+          if (state === 'fault' && wasActive && get().activeBleSessionId && get().startedAt) {
+            const endedAt = Date.now(); const current = get()
+            const session: Session = { id: current.activeBleSessionId!, startedAt: current.startedAt!, endedAt, state: 'incomplete', source: 'ble', samples: current.bleMicSamples.slice(-1200) }
+            set({ endedAt, sessions: persistBleSession(session, current.sessions), activeBleSessionId: undefined })
+          }
+        } else if (event.kind === 'pressure') {
+          const raw = typeof event.value.raw_counts === 'number' ? event.value.raw_counts : undefined
+          const mmhg = typeof event.value.mmhg === 'number' ? event.value.mmhg : undefined
+          const valid = event.value.valid === true && event.value.pressure_calibrated === true && mmhg !== undefined && Number.isFinite(mmhg) && mmhg >= 0 && mmhg <= 400
+          set(s => ({ blePressureRaw: raw, blePressureMmHg: valid ? mmhg : undefined,
+            blePressureSamples: valid && ['measuring', 'stopping'].includes(s.state)
+              ? [...s.blePressureSamples.slice(-599), { receivedAt: Date.now(), cuffPressureMmHg: mmhg!, deviceState: 'measuring' }]
+              : s.blePressureSamples }))
+        } else if (event.kind === 'korotkoff') {
+          const timestamp = event.value.device_timestamp_ms
+          const envelope = event.value.envelope
+          const raw = event.value.raw_adc
+          const mmhg = event.value.mmhg
+          const filtered = event.value.filtered
+          if (typeof timestamp === 'number' && typeof envelope === 'number' && Number.isFinite(envelope) && typeof filtered === 'number' && Number.isFinite(filtered) && typeof raw === 'number') {
+            const pressureValid = event.value.pressure_valid === true && typeof mmhg === 'number' && Number.isFinite(mmhg) && mmhg >= 0 && mmhg <= 400
+            const sample: Telemetry = { receivedAt: Date.now(), deviceTimestampMs: timestamp, microphoneFiltered: filtered, acousticEnvelope: envelope, eventDetected: event.value.event_detected === true,
+              ...(pressureValid ? { cuffPressureMmHg: mmhg as number } : {}), deviceState: 'measuring' }
+            set(s => ({ bleMicSamples: [...s.bleMicSamples.slice(-1199), sample] }))
+          }
+        }
         else if (event.kind === 'fault') set({ bleFault: String(event.value.code ?? 'unknown') })
         else if (event.kind === 'error') set({ bleError: String(event.value.message ?? 'Device connection failed.') })
       })
@@ -107,6 +163,13 @@ export const useAppStore = create<Store>((set, get) => ({
   sendPhoneCommand: async command => {
     try { await phoneBle.send(command); set({ bleError: undefined }) }
     catch (error) { set({ bleError: errorMessage(error, 'Device command failed.') }); throw error }
+  },
+  resetDeviceFault: async () => {
+    if (!get().bleConnected) throw new Error('Connect to the controller over BLE before resetting its fault.')
+    set({ busy: true, error: undefined, bleError: undefined })
+    try { await get().sendPhoneCommand('RESET_FAULT'); await get().sendPhoneCommand('GET_STATUS') }
+    catch (error) { const message = errorMessage(error, 'The controller did not accept fault reset.'); set({ error: message, bleError: message }); throw error }
+    finally { set({ busy: false }) }
   },
   selectDevice: id => { const device = get().devices.find(item => item.id === id); set({ selectedDeviceId: id, deviceOnline: device?.online === true, connected: device?.online === true, state: device?.online && device.reported_state === 'idle' ? 'connected_idle' : 'disconnected' }) },
   loadHistory: async (offset = 0) => {
@@ -162,9 +225,9 @@ export const useAppStore = create<Store>((set, get) => ({
       catch (e) { set({ busy: false, connected: false, state: 'error', error: errorMessage(e, 'Could not connect to the demo device.') }); return false }
     }
     if (current.bleConnected && (!current.apiToken || !current.backendAvailable || !current.deviceOnline)) {
-      set({ busy: true, error: undefined })
-      try { await get().sendPhoneCommand('START_MEASUREMENT'); return get().bleState === 'measuring' }
-      catch (e) { set({ state: get().bleState === 'fault' ? 'device_fault' : 'error', error: errorMessage(e, 'The device rejected Start over BLE.') }); return false }
+      set({ busy: true, error: undefined, startedAt: undefined, endedAt: undefined, blePressureSamples: [], bleMicSamples: [], activeBleSessionId: crypto.randomUUID() })
+      try { await get().sendPhoneCommand('START_MEASUREMENT'); if (get().bleState !== 'fault' && get().bleState !== 'emergency_stop') set({ state: 'measuring', startedAt: get().startedAt ?? Date.now(), endedAt: undefined }); return get().bleState === 'measuring' || get().state === 'measuring' }
+      catch (e) { set({ state: get().bleState === 'fault' ? 'device_fault' : 'error', activeBleSessionId: undefined, error: errorMessage(e, 'The device rejected Start over BLE.') }); return false }
       finally { set({ busy: false }) }
     }
     set({ busy: true, error: undefined, state: 'connecting', sessionSync: 'pending', samples: [], acousticEvents: [], remoteSession: undefined })
@@ -236,7 +299,7 @@ export const useAppStore = create<Store>((set, get) => ({
     }
     if (current.bleConnected && (!current.remoteSession || !current.apiToken || !current.backendAvailable)) {
       set({ state: 'stopping', busy: true, error: undefined })
-      try { await get().sendPhoneCommand('STOP_MEASUREMENT'); set({ busy: false, state: 'uncertain', error: 'The controller acknowledged Stop, but its local state must confirm safe release.' }) }
+      try { await get().sendPhoneCommand('STOP_MEASUREMENT'); set({ busy: false, state: 'stopping', error: undefined }) }
       catch (e) { set({ state: 'uncertain', busy: false, error: errorMessage(e, 'Stop was not confirmed over BLE.') }) }
       return
     }
@@ -259,10 +322,10 @@ export const useAppStore = create<Store>((set, get) => ({
       set({ state: 'uncertain', busy: false, sessionSync: 'uncertain', error: 'Stop was requested but completion was not confirmed. The device may still be running.' })
     } catch (e) { set({ state: 'uncertain', busy: false, sessionSync: 'uncertain', error: `${errorMessage(e, 'Stop request failed.')} Device stop is not confirmed.` }) }
   },
-  resetSession: () => { const s = get(); if (s.busy || (s.state !== 'completed' && s.state !== 'cancelled')) return; remoteAbort?.abort(); liveSessionId = undefined; set({ state: s.connected ? 'connected_idle' : 'disconnected', samples: [], acousticEvents: [], startedAt: undefined, remoteSession: undefined, error: undefined }) },
+  resetSession: () => { const s = get(); if (s.busy || (s.state !== 'completed' && s.state !== 'cancelled')) return; remoteAbort?.abort(); liveSessionId = undefined; set({ state: s.connected || s.bleConnected ? 'connected_idle' : 'disconnected', samples: [], acousticEvents: [], bleMicSamples: [], blePressureSamples: [], blePressureMmHg: undefined, startedAt: undefined, endedAt: undefined, activeBleSessionId: undefined, remoteSession: undefined, error: undefined }) },
   addSample: sample => set(s => ({ samples: [...s.samples.slice(-(MAX_BUFFERED_SAMPLES - 1)), sample] })),
   clearError: () => set({ error: undefined }),
-  setDemo: value => { const state = get().state; if (!get().busy && state !== 'measuring' && state !== 'stopping' && state !== 'starting') { remoteAbort?.abort(); set({ demo: value, connected: false, bleConnected: false, deviceOnline: false, state: 'disconnected', error: undefined, samples: [], acousticEvents: [], remoteSession: undefined, sessionSync: value ? 'not_applicable' : 'uncertain' }); void demoDevice.disconnect() } },
+  setDemo: value => { const state = get().state; if (!get().busy && state !== 'measuring' && state !== 'stopping' && state !== 'starting') { remoteAbort?.abort(); set({ demo: value, connected: false, bleConnected: false, deviceOnline: false, state: 'disconnected', error: undefined, samples: [], acousticEvents: [], blePressureMmHg: undefined, blePressureSamples: [], startedAt: undefined, endedAt: undefined, remoteSession: undefined, sessionSync: value ? 'not_applicable' : 'uncertain' }); void demoDevice.disconnect() } },
   simulateDisconnect: () => { if (!get().demo || !get().connected) return; const wasMeasuring = get().state === 'measuring'; demoDevice.simulateLinkLoss(); set({ connected: false, bleConnected: false, state: wasMeasuring ? 'uncertain' : 'disconnected', error: wasMeasuring ? 'Connection lost. The device stop state is not confirmed.' : undefined }) },
   simulateFault: () => { if (!get().demo || !get().connected || get().busy) return; demoDevice.simulateFault(); set({ state: 'device_fault', error: 'The demo device reported a simulated fault.' }) },
 }))

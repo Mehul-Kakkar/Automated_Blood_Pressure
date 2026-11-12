@@ -12,8 +12,9 @@
 #include "ble_manager.h"
 
 namespace { uint32_t lastDisplayStatus=0; }
-static const char* faultName(FaultCode f){switch(f){case FaultCode::NONE:return "none";case FaultCode::PRESSURE_UNCALIBRATED:return "pressure_uncalibrated";case FaultCode::PINMAP_UNVERIFIED:return "pinmap_unverified";case FaultCode::VALVE_UNVERIFIED:return "valve_unverified";case FaultCode::SENSOR_DISCONNECTED:return "sensor_disconnected";case FaultCode::INFLATION_TIMEOUT:return "inflation_timeout";case FaultCode::PRESSURE_LIMIT:return "pressure_limit";case FaultCode::AUTO_INFLATION_DISABLED:return "automatic_inflation_disabled";case FaultCode::STOP_RELEASE_UNVERIFIED:return "stop_release_unverified";default:return "controller_fault";}}
-static void publishLocalStatus(){DeviceState s=deviceStateSnapshot();StaticJsonDocument<220>d;d["state"]=backendState(s.state);d["uptime_ms"]=s.uptimeMs;if(pressureSensorConnected(millis())){d["pressure_raw"]=latestPressureRaw();d["pressure_mmhg"]=s.pressureMmhg;}else{d["pressure_raw"]=nullptr;d["pressure_mmhg"]=nullptr;}d["pressure_calibrated"]=PRESSURE_CALIBRATION_CONFIRMED;d["pressure_estimate_only"]=true;d["heart_rate_bpm"]=nullptr;d["fault"]=faultName(s.fault);char body[220];serializeJson(d,body,sizeof(body));displayPublishStatus(body);}
+static const char* faultName(FaultCode f){switch(f){case FaultCode::NONE:return "none";case FaultCode::PRESSURE_UNCALIBRATED:return "pressure_uncalibrated";case FaultCode::PINMAP_UNVERIFIED:return "pinmap_unverified";case FaultCode::VALVE_UNVERIFIED:return "valve_unverified";case FaultCode::SENSOR_DISCONNECTED:return "sensor_disconnected";case FaultCode::INFLATION_TIMEOUT:return "inflation_timeout";case FaultCode::PRESSURE_LIMIT:return "pressure_limit";case FaultCode::AUTO_INFLATION_DISABLED:return "automatic_inflation_disabled";case FaultCode::STOP_RELEASE_UNVERIFIED:return "stop_release_unverified";case FaultCode::ADC_SATURATION:return "adc_saturation";case FaultCode::IMPLAUSIBLE_PRESSURE:return "implausible_pressure";default:return "controller_fault";}}
+static const char* displayStateName(MeasurementState s){switch(s){case MeasurementState::BOOT:return "boot";case MeasurementState::IDLE:return "idle";case MeasurementState::PRECHECK:return "initializing";case MeasurementState::INFLATING:return "inflating";case MeasurementState::MEASURING:return "measuring";case MeasurementState::DEFLATING:return "deflating";case MeasurementState::COMPLETED:return "completed";case MeasurementState::FAULT:return "error";case MeasurementState::EMERGENCY_STOP:return "emergency_stop";}return "unknown";}
+static void publishLocalStatus(){DeviceState s=deviceStateSnapshot();StaticJsonDocument<220>d;d["state"]=displayStateName(s.state);d["uptime_ms"]=s.uptimeMs;if(pressureSensorConnected(millis())&&s.pressureMmhgAvailable){d["pressure_raw"]=latestPressureRaw();d["pressure_mmhg"]=s.pressureMmhg;}else{d["pressure_raw"]=nullptr;d["pressure_mmhg"]=nullptr;}d["pressure_calibrated"]=PRESSURE_CALIBRATION_CONFIRMED;d["pressure_estimate_only"]=true;d["heart_rate_bpm"]=nullptr;d["fault"]=faultName(s.fault);char body[220];serializeJson(d,body,sizeof(body));displayPublishStatus(body);}
 
 void setup(){
   Serial.begin(115200);
@@ -26,8 +27,7 @@ void setup(){
   bleManagerBegin();
   if(!sessionManagerReady()||!sensorManagerReady()){xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.state=MeasurementState::FAULT;deviceState.fault=FaultCode::COMMAND_QUEUE_FULL;xSemaphoreGive(deviceStateMutex);Serial.println("Queue allocation failed; remote measurement commands remain disabled.");return;}
   mqttManagerBegin();
-  if(TIMED_PUMP_TEST_MODE)Serial.printf("IntegratedController: TIMED ACOUSTIC TEST enabled; pump=%lu ms, then normally-open valve releases; pressure feedback bypassed.\n",(unsigned long)TIMED_PUMP_TEST_DURATION_MS);
-  else Serial.println("IntegratedController: pressure-controlled inflation enabled; normally-open release valve opens at 130 mmHg.");
+  Serial.println("IntegratedController: pressure-controlled inflation enabled; normally-open release valve opens at configured pressure limit.");
 }
 
 void loop(){
@@ -42,7 +42,9 @@ void loop(){
   }
   if(measurementActive(s.state)&&!pressureSensorConnected(now)&&!s.timedPumpTest){
     FaultCode stopFault=safetyEmergencyStop();xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.state=MeasurementState::FAULT;deviceState.fault=stopFault==FaultCode::NONE?FaultCode::SENSOR_DISCONNECTED:stopFault;xSemaphoreGive(deviceStateMutex);
-  } else if(s.state==MeasurementState::INFLATING&&!s.timedPumpTest&&s.pressureMmhg>=MAX_INFLATION_PRESSURE_MMHG){
+  } else if(s.state==MeasurementState::INFLATING&&(s.fault==FaultCode::ADC_SATURATION||s.fault==FaultCode::IMPLAUSIBLE_PRESSURE)){
+    FaultCode cause=s.fault;FaultCode releaseFault=safetyEmergencyStop();xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.state=MeasurementState::FAULT;deviceState.fault=releaseFault==FaultCode::NONE?cause:releaseFault;xSemaphoreGive(deviceStateMutex);
+  } else if(s.state==MeasurementState::INFLATING&&!s.timedPumpTest&&s.pressureMmhgAvailable&&s.pressureMmhg>=MAX_INFLATION_PRESSURE_MMHG){
     // Stop pump first, then deenergize the normally-open valve to release cuff pressure.
     pumpStop();const bool released=valveRequestVerifiedRelease();xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.state=released?MeasurementState::DEFLATING:MeasurementState::FAULT;deviceState.fault=released?FaultCode::NONE:FaultCode::STOP_RELEASE_UNVERIFIED;xSemaphoreGive(deviceStateMutex);
   } else if(s.state==MeasurementState::INFLATING&&pumpTimedOut(now)){

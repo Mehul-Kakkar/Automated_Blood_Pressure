@@ -72,12 +72,14 @@ bool staleReported = false;
 volatile bool pendingUiUpdate = false;
 char pendingStatus[48] = "WAITING FOR CONTROLLER";
 char pendingMessage[100] = "";
+char pendingPressure[24] = "--";
 }
 
 static lv_obj_t *connectionLabel = nullptr;
 static lv_obj_t *controllerStateLabel = nullptr;
 static lv_obj_t *startButtonLabel = nullptr;
 static lv_obj_t *stopButtonLabel = nullptr;
+static lv_obj_t *cuffPressureLabel = nullptr;
 
 static String makeRequestId() {
   uint32_t a = esp_random(), b = esp_random(), c = esp_random(), d = esp_random();
@@ -176,8 +178,15 @@ static void onEspNowReceive(const esp_now_recv_info_t *info,
     StaticJsonDocument<192> document;
     if (deserializeJson(document, packet.payload) == DeserializationError::Ok) {
       const char *state = document["state"] | "unknown";
+      const char *fault = document["fault"] | "none";
       strlcpy(pendingStatus, state, sizeof(pendingStatus));
-      snprintf(pendingMessage, sizeof(pendingMessage), "Controller: %s", state);
+      if (document["pressure_mmhg"].is<float>() || document["pressure_mmhg"].is<double>()) {
+        snprintf(pendingPressure, sizeof(pendingPressure), "%.1f", document["pressure_mmhg"].as<float>());
+        snprintf(pendingMessage, sizeof(pendingMessage), "%.1f mmHg | %s%s%s", document["pressure_mmhg"].as<float>(), state, strcmp(fault,"none") ? " | " : "", strcmp(fault,"none") ? fault : "");
+      } else {
+        strlcpy(pendingPressure, "--", sizeof(pendingPressure));
+        snprintf(pendingMessage, sizeof(pendingMessage), "%s%s%s", state, strcmp(fault,"none") ? " | " : "", strcmp(fault,"none") ? fault : "");
+      }
       pendingUiUpdate = true;
       Serial.printf("Controller state=%s uptime_ms=%lu pressure_raw=%ld\n",
                     state, (unsigned long)(document["uptime_ms"] | 0UL),
@@ -237,6 +246,7 @@ static void processTransportUi() {
     pendingUiUpdate = false;
     if (connectionLabel) lv_label_set_text(connectionLabel, pendingMessage);
     if (controllerStateLabel) lv_label_set_text(controllerStateLabel, pendingStatus);
+    if (cuffPressureLabel) lv_label_set_text(cuffPressureLabel, pendingPressure);
   }
   if (mainSeen && !staleReported && (uint32_t)(millis() - lastMainAt) > 5000) {
     staleReported = true;
@@ -390,11 +400,11 @@ static void buildDashboard() {
   makeMetricPanel(screenDashboard, "DIA mmHg", 110, &lv_font_montserrat_48);
 
   lv_obj_t *mapPanel = makePanel(screenDashboard, 94, 64, 214, 38);
-  lv_obj_t *mapTitle = makeLabel(mapPanel, "MAP", 0x64748B);
+  lv_obj_t *mapTitle = makeLabel(mapPanel, "CUFF mmHg", 0x64748B);
   lv_obj_align(mapTitle, LV_ALIGN_TOP_LEFT, 4, 2);
-  lv_obj_t *mapValue = makeLabel(mapPanel, "--", 0x0284C7,
+  cuffPressureLabel = makeLabel(mapPanel, "--", 0x0284C7,
                                  &lv_font_montserrat_20);
-  lv_obj_align(mapValue, LV_ALIGN_BOTTOM_LEFT, 4, -2);
+  lv_obj_align(cuffPressureLabel, LV_ALIGN_BOTTOM_LEFT, 4, -2);
 
   lv_obj_t *pulsePanel = makePanel(screenDashboard, 94, 66, 214, 106);
   lv_obj_t *pulseTitle = makeLabel(pulsePanel, "BPM", 0xDC2626);

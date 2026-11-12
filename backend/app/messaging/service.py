@@ -342,8 +342,16 @@ class MessagingService:
                 device.pressure_calibration_confirmed and device.pressure_calibration_version
             ):
                 raise MessageRejected("Pressure telemetry requires an explicitly confirmed device calibration.")
-            if any(event.pressure_mmhg is not None for event in envelope.payload.acoustic_events):
-                raise MessageRejected("Event pressure association is unsupported without a linked pressure sample.")
+            samples_by_device_time = {
+                sample.device_timestamp_ms: sample.pressure_mmhg
+                for sample in envelope.payload.samples
+                if sample.device_timestamp_ms is not None and sample.pressure_mmhg is not None
+            }
+            for event in envelope.payload.acoustic_events:
+                if event.pressure_mmhg is None:
+                    continue
+                if event.device_timestamp_ms is None or samples_by_device_time.get(event.device_timestamp_ms) != event.pressure_mmhg:
+                    raise MessageRejected("Event pressure must match a pressure sample at the same device timestamp.")
             pressure_calibration_version = device.pressure_calibration_version
             existing_max = db.scalar(
                 select(func.max(TelemetrySample.sample_sequence)).where(

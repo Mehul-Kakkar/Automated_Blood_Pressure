@@ -18,7 +18,7 @@ UUID suffix  Property      Content
 ...5003      Read/Notify   Controller state, uptime, session, fault, calibration
 ...5004      Read/Notify   Raw pressure counts; mmHg is null until calibrated
 ...5005      Read/Notify   Heart rate; null until actually available
-...5006      Read/Notify   Korotkoff event count; unavailable until implemented
+...5006      Read/Notify   Live microphone sample stream during measurement
 ...5007      Read/Notify   Progress; unavailable until a validated estimator exists
 ...5008      Write        Phone command JSON
 ...5009      Notify       Command acknowledgement JSON
@@ -27,7 +27,7 @@ UUID suffix  Property      Content
 Commands are UTF-8 JSON, max 128 bytes:
 {"v":1,"command_id":"<UUID>","command":"GET_STATUS"}
 Supported command names: GET_STATUS, GET_DEVICE_INFO, REQUEST_LIVE_DATA,
-START_MEASUREMENT, STOP_MEASUREMENT. Unknown or malformed messages are ignored
+START_MEASUREMENT, STOP_MEASUREMENT, RESET_FAULT. Unknown or malformed messages are ignored
 or rejected; duplicate command IDs are rejected during the current boot.
 
 Acknowledgement:

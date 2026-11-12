@@ -1,4 +1,5 @@
 #include "session_manager.h"
+#include "pressure_manager.h"
 #include "device_state.h"
 #include "safety_manager.h"
 #include "pump_controller.h"
@@ -8,7 +9,7 @@
 #include <freertos/queue.h>
 #include <cstring>
 namespace {QueueHandle_t commands=nullptr,results=nullptr;}
-static const char* faultReason(FaultCode f){switch(f){case FaultCode::PRESSURE_UNCALIBRATED:return "pressure_uncalibrated";case FaultCode::PINMAP_UNVERIFIED:return "pinmap_unverified";case FaultCode::VALVE_UNVERIFIED:return "valve_unverified";case FaultCode::SENSOR_DISCONNECTED:return "sensor_disconnected";case FaultCode::INFLATION_TIMEOUT:return "inflation_timeout";case FaultCode::PRESSURE_LIMIT:return "pressure_limit";case FaultCode::AUTO_INFLATION_DISABLED:return "automatic_inflation_disabled";case FaultCode::STOP_RELEASE_UNVERIFIED:return "stop_release_unverified";case FaultCode::COMMAND_QUEUE_FULL:return "command_queue_full";default:return "none";}}
+static const char* faultReason(FaultCode f){switch(f){case FaultCode::PRESSURE_UNCALIBRATED:return "pressure_uncalibrated";case FaultCode::PINMAP_UNVERIFIED:return "pinmap_unverified";case FaultCode::VALVE_UNVERIFIED:return "valve_unverified";case FaultCode::SENSOR_DISCONNECTED:return "sensor_disconnected";case FaultCode::INFLATION_TIMEOUT:return "inflation_timeout";case FaultCode::PRESSURE_LIMIT:return "pressure_limit";case FaultCode::AUTO_INFLATION_DISABLED:return "automatic_inflation_disabled";case FaultCode::STOP_RELEASE_UNVERIFIED:return "stop_release_unverified";case FaultCode::COMMAND_QUEUE_FULL:return "command_queue_full";case FaultCode::ADC_SATURATION:return "adc_saturation";case FaultCode::IMPLAUSIBLE_PRESSURE:return "implausible_pressure";default:return "none";}}
 QueueHandle_t sessionCommandQueue(){return commands;}
 QueueHandle_t sessionResultQueue(){return results;}
 void sessionManagerBegin(){commands=xQueueCreate(COMMAND_QUEUE_CAPACITY,sizeof(ControllerCommand));results=xQueueCreate(COMMAND_QUEUE_CAPACITY,sizeof(CommandResult));}
@@ -23,6 +24,17 @@ void sessionManagerPoll(){
     if(cmd.kind==CommandKind::START)Serial.printf("START command received (origin=%u, state=%u)\n",(unsigned)cmd.origin,(unsigned)current.state);
     else if(cmd.kind==CommandKind::STOP)Serial.printf("STOP command received (origin=%u, state=%u)\n",(unsigned)cmd.origin,(unsigned)current.state);
     if(cmd.kind==CommandKind::STATUS_REQUEST){strlcpy(result.status,"completed",sizeof(result.status));strlcpy(result.reasonCode,"status_reported",sizeof(result.reasonCode));}
+    else if(cmd.kind==CommandKind::RESET_FAULT){
+      if(current.state!=MeasurementState::FAULT&&current.state!=MeasurementState::EMERGENCY_STOP){strlcpy(result.status,"rejected",sizeof(result.status));strlcpy(result.reasonCode,"device_not_in_fault",sizeof(result.reasonCode));}
+      else {
+        pumpStop();const bool released=valveRequestVerifiedRelease();
+        DeviceState safe=deviceStateSnapshot();
+        const bool pressureSafe=pressureSensorConnected(millis())&&safe.pressureMmhgAvailable&&isfinite(safe.pressureMmhg)&&safe.pressureMmhg<=FAULT_RESET_SAFE_PRESSURE_MMHG;
+        if(!released){strlcpy(result.status,"rejected",sizeof(result.status));strlcpy(result.reasonCode,"release_failed",sizeof(result.reasonCode));}
+        else if(!pressureSafe){strlcpy(result.status,"rejected",sizeof(result.status));strlcpy(result.reasonCode,"pressure_not_safe_or_sensor_unavailable",sizeof(result.reasonCode));}
+        else {xSemaphoreTake(deviceStateMutex,portMAX_DELAY);deviceState.state=MeasurementState::IDLE;deviceState.fault=FaultCode::NONE;deviceState.sessionId[0]='\0';deviceState.startRequestId[0]='\0';deviceState.timedPumpTest=false;xSemaphoreGive(deviceStateMutex);strlcpy(result.status,"accepted",sizeof(result.status));strlcpy(result.reasonCode,"fault_reset",sizeof(result.reasonCode));}
+      }
+    }
     else if(cmd.kind==CommandKind::START){
       if(current.state==MeasurementState::FAULT||current.state==MeasurementState::EMERGENCY_STOP){strlcpy(result.status,"rejected",sizeof(result.status));strlcpy(result.reasonCode,faultReason(current.fault),sizeof(result.reasonCode));}
       else if(measurementActive(current.state)){strlcpy(result.status,"rejected",sizeof(result.status));strlcpy(result.reasonCode,"measurement_active",sizeof(result.reasonCode));}

@@ -1,9 +1,9 @@
 import { z } from 'zod'
 
-export const TelemetrySchema = z.object({ receivedAt: z.number().finite(), deviceTimestampMs: z.number().finite().nonnegative().optional(), sequence: z.number().int().nonnegative().optional(), valid: z.boolean().optional(), qualityFlags: z.array(z.string()).optional(), heartRateBpm: z.number().finite().min(25).max(240).optional(), cuffPressureMmHg: z.number().finite().min(0).max(400).optional(), acousticEnvelope: z.number().finite().min(0).optional(), deviceState: z.enum(['idle', 'measuring', 'stopped', 'fault']) })
+export const TelemetrySchema = z.object({ receivedAt: z.number().finite(), deviceTimestampMs: z.number().finite().nonnegative().optional(), sequence: z.number().int().nonnegative().optional(), valid: z.boolean().optional(), qualityFlags: z.array(z.string()).optional(), eventDetected: z.boolean().optional(), heartRateBpm: z.number().finite().min(25).max(240).optional(), cuffPressureMmHg: z.number().finite().min(0).max(400).optional(), microphoneFiltered: z.number().finite().optional(), acousticEnvelope: z.number().finite().min(0).optional(), deviceState: z.enum(['idle', 'measuring', 'stopped', 'fault']) })
 export type Telemetry = z.infer<typeof TelemetrySchema>
 export type SessionState = 'disconnected'|'connecting'|'connected_idle'|'starting'|'measuring'|'stopping'|'completed'|'cancelled'|'error'|'device_fault'|'uncertain'
-export type Session = { id: string; startedAt: number; endedAt?: number; state: 'completed'|'cancelled'; source: 'demo'; samples: Telemetry[] }
+export type Session = { id: string; startedAt: number; endedAt?: number; state: 'completed'|'cancelled'|'incomplete'; source: 'demo'|'ble'; samples: Telemetry[] }
 
 export interface DeviceAdapter {
   connect(): Promise<void>

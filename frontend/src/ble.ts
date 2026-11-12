@@ -106,7 +106,7 @@ export class PhoneBleClient {
   }
   get connected() { return this.server?.connected === true }
 
-  async send(command: 'GET_STATUS' | 'START_MEASUREMENT' | 'STOP_MEASUREMENT' | 'REQUEST_LIVE_DATA' | 'GET_DEVICE_INFO') {
+  async send(command: 'GET_STATUS' | 'START_MEASUREMENT' | 'STOP_MEASUREMENT' | 'RESET_FAULT' | 'REQUEST_LIVE_DATA' | 'GET_DEVICE_INFO') {
     const characteristic = this.chars.get('command')
     if (!this.connected || !characteristic) throw new Error('Connect to the controller over BLE first.')
     const commandId = crypto.randomUUID()
