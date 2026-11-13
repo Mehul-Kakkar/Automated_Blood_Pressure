@@ -1,6 +1,7 @@
-
 #include "HX710B.h"
 #include <math.h>
+#include <ctype.h>
+#include <string.h>
 
 // =====================================================
 // PIN ASSIGNMENTS
@@ -18,20 +19,6 @@
 #define VALVE_EN  16
 
 // =====================================================
-// TEST MODES
-// =====================================================
-
-#define BASELINE   0
-#define CONTINUOUS 1
-#define PULSED     2
-
-const char* testNames[] = {
-  "A_BASELINE",
-  "B_CONTINUOUS",
-  "C_PULSED"
-};
-
-// =====================================================
 // CONFIGURATION
 // =====================================================
 
@@ -42,16 +29,26 @@ const float RAW_OFFSET = 170000.0f;
 const float PSI_TO_MMHG = 51.7149f;
 
 const float INFLATION_TARGET = 80.0f;
-const float MAX_PRESSURE = 130.0f;
+const float DEFLATION_TARGET = 60.0f;
 const float RELEASE_TARGET = 5.0f;
 
-const uint32_t TEST_DURATION_MS = 10000UL;
-const uint32_t SAMPLE_INTERVAL_MS = 100UL;
+const float MAX_PRESSURE = 95.0f;
+
+// Pump continues for this long after reaching 80 mmHg.
+const uint32_t POST_TARGET_PUMP_MS = 1000UL;
+
 const uint32_t MAX_INFLATION_MS = 30000UL;
+const uint32_t MAX_DEFLATION_MS = 30000UL;
 const uint32_t MAX_RELEASE_MS = 30000UL;
 
 const int32_t ADC_MAX = 8388607L;
 const int32_t ADC_MIN = -8388608L;
+
+const int MAX_SAMPLES = 3000;
+
+// =====================================================
+// SENSOR
+// =====================================================
 
 HX710B air_press(SCK_PIN, SDI_PIN);
 
@@ -59,14 +56,50 @@ int32_t rawReading = 0;
 float pressureMMHg = 0.0f;
 float pressurePSI = 0.0f;
 
-bool testRunning = false;
+// =====================================================
+// SYSTEM STATE
+// =====================================================
+
 bool systemFault = false;
+bool testRunning = false;
+bool runRequested = false;
 bool stopRequested = false;
 
-uint32_t cycleNumber = 0;
+char commandBuffer[20];
+int commandLength = 0;
 
 // =====================================================
-// SENSOR CONVERSION
+// CAPTURE DATA
+// =====================================================
+
+struct PressureSample {
+  uint32_t timeUs;
+  float pressure;
+  int32_t raw;
+};
+
+PressureSample samples[MAX_SAMPLES];
+
+int sampleCount = 0;
+uint32_t pumpOffTimeUs = 0;
+
+// =====================================================
+// REGRESSION OUTPUT VARIABLES
+// =====================================================
+
+uint32_t windowCount = 0;
+
+float windowRegressionRate = NAN;
+float windowAverageRate = NAN;
+float windowRSquared = NAN;
+float windowMaxResidual = NAN;
+
+float windowFirstPressure = NAN;
+float windowLastPressure = NAN;
+float windowDuration = NAN;
+
+// =====================================================
+// PRESSURE CONVERSION
 // =====================================================
 
 float convertPSI(int32_t raw) {
@@ -130,6 +163,7 @@ bool readPressure() {
 // =====================================================
 
 void pumpOn() {
+
   digitalWrite(PUMP_IN1, HIGH);
   digitalWrite(PUMP_IN2, LOW);
   digitalWrite(PUMP_EN, HIGH);
@@ -140,16 +174,19 @@ void pumpOff() {
 }
 
 void valveOpen() {
+  // Normally-open valve: de-energized = open.
   digitalWrite(VALVE_EN, LOW);
 }
 
 void valveClose() {
+
   digitalWrite(VALVE_IN1, HIGH);
   digitalWrite(VALVE_IN2, LOW);
   digitalWrite(VALVE_EN, HIGH);
 }
 
 void safeState() {
+
   pumpOff();
   valveOpen();
 }
@@ -158,96 +195,399 @@ void safeState() {
 // SERIAL COMMANDS
 // =====================================================
 
-void checkCommand() {
+void pollSerial() {
 
-  if (!Serial.available()) return;
+  while (Serial.available()) {
 
-  String command = Serial.readStringUntil('\n');
-  command.trim();
-  command.toUpperCase();
+    char c = Serial.read();
 
-  if (command == "STOP") {
-    stopRequested = true;
-    safeState();
-    Serial.println("STOP REQUESTED.");
+    if (c == '\r') {
+      continue;
+    }
+
+    if (c == '\n') {
+
+      commandBuffer[commandLength] = '\0';
+
+      for (int i = 0; i < commandLength; i++) {
+        commandBuffer[i] =
+            toupper((unsigned char)commandBuffer[i]);
+      }
+
+      if (strcmp(commandBuffer, "STOP") == 0) {
+
+        stopRequested = true;
+        safeState();
+
+        Serial.println("STOP REQUESTED.");
+        Serial.println("Pump OFF. Valve OPEN.");
+      }
+
+      else if (strcmp(commandBuffer, "RUN") == 0) {
+
+        if (systemFault) {
+          Serial.println("System fault. Reset required.");
+        }
+
+        else if (testRunning || runRequested) {
+          Serial.println("Test already running or queued.");
+        }
+
+        else {
+          stopRequested = false;
+          runRequested = true;
+        }
+      }
+
+      else if (strcmp(commandBuffer, "HELP") == 0) {
+
+        Serial.println();
+        Serial.println("COMMANDS:");
+        Serial.println("RUN  - Start passive deflation test");
+        Serial.println("STOP - Stop pump and open valve");
+        Serial.println("HELP - Show commands");
+      }
+
+      else if (commandLength > 0) {
+        Serial.println("Unknown command.");
+      }
+
+      commandLength = 0;
+    }
+
+    else if (commandLength < (int)sizeof(commandBuffer) - 1) {
+      commandBuffer[commandLength++] = c;
+    }
+
+    else {
+      commandLength = 0;
+    }
   }
 }
 
-bool checkSafety() {
+// =====================================================
+// WAIT WHILE CHECKING STOP COMMAND
+// =====================================================
 
-  checkCommand();
+bool waitWithStop(uint32_t durationMs) {
 
-  if (stopRequested) {
-    safeState();
-    return false;
-  }
+  uint32_t startTime = millis();
 
-  if (!readPressure()) {
-    safeState();
-    systemFault = true;
-    Serial.println("SYSTEM FAULT: Sensor failure.");
-    return false;
-  }
+  while (millis() - startTime < durationMs) {
 
-  if (pressureMMHg >= MAX_PRESSURE) {
-    safeState();
-    systemFault = true;
-    Serial.println("SYSTEM FAULT: Maximum pressure reached.");
-    return false;
+    pollSerial();
+
+    if (stopRequested) {
+      safeState();
+      return false;
+    }
+
+    delay(1);
   }
 
   return true;
 }
 
 // =====================================================
-// INFLATION
+// SAFETY FAULT
 // =====================================================
 
-bool inflateToTarget() {
+void triggerFault(const char* reason) {
+
+  safeState();
+
+  systemFault = true;
 
   Serial.println();
-  Serial.println("INFLATING TO 80 mmHg...");
+  Serial.println("!!!!!!!! SYSTEM FAULT !!!!!!!!");
+  Serial.println(reason);
+  Serial.println("Pump OFF. Valve OPEN.");
+}
 
-  pumpOff();
-  valveClose();
-  delay(150);
+// =====================================================
+// STORE SAMPLE
+// =====================================================
+
+bool storeSample(
+  uint32_t timeUs,
+  float pressure,
+  int32_t raw
+) {
+
+  if (sampleCount >= MAX_SAMPLES) {
+    return false;
+  }
+
+  samples[sampleCount].timeUs = timeUs;
+  samples[sampleCount].pressure = pressure;
+  samples[sampleCount].raw = raw;
+
+  sampleCount++;
+
+  return true;
+}
+
+// =====================================================
+// VENT BEFORE STARTING
+// =====================================================
+
+bool ventBeforeRun() {
+
+  Serial.println();
+  Serial.println("Checking initial pressure...");
+
+  safeState();
 
   uint32_t startTime = millis();
-  uint32_t lastPrint = 0;
 
-  pumpOn();
+  while (millis() - startTime < MAX_RELEASE_MS) {
 
-  while (millis() - startTime < MAX_INFLATION_MS) {
+    pollSerial();
 
-    if (!checkSafety()) return false;
-
-    if (millis() - lastPrint >= 1000UL) {
-      Serial.printf("Inflation: %.2f mmHg\n", pressureMMHg);
-      lastPrint = millis();
+    if (stopRequested) {
+      return false;
     }
 
-    if (pressureMMHg >= INFLATION_TARGET) {
+    if (!readPressure()) {
+      triggerFault("Sensor failure before test.");
+      return false;
+    }
 
-      pumpOff();
-      valveOpen();
+    if (pressureMMHg >= MAX_PRESSURE) {
+      triggerFault("Pressure exceeds safety limit.");
+      return false;
+    }
+
+    if (pressureMMHg <= RELEASE_TARGET) {
 
       Serial.printf(
-        "Inflation complete: %.2f mmHg\n",
+        "Initial pressure: %.3f mmHg\n",
         pressureMMHg
       );
 
-      delay(200);
       return true;
     }
 
     delay(5);
   }
 
-  safeState();
-  systemFault = true;
-  Serial.println("SYSTEM FAULT: Inflation timeout.");
+  triggerFault("Could not vent initial pressure.");
 
   return false;
+}
+
+// =====================================================
+// INFLATE AND BEGIN CAPTURE
+// =====================================================
+
+bool inflateAndStartCapture() {
+
+  Serial.println();
+  Serial.println("Inflating to 80 mmHg...");
+
+  pumpOff();
+  valveClose();
+
+  if (!waitWithStop(150)) {
+    return false;
+  }
+
+  uint32_t startTime = millis();
+  uint32_t lastPrint = 0;
+
+  uint32_t targetReachedTime = 0;
+
+  bool targetReached = false;
+
+  pumpOn();
+
+  while (millis() - startTime < MAX_INFLATION_MS) {
+
+    pollSerial();
+
+    if (stopRequested) {
+      safeState();
+      return false;
+    }
+
+    if (!readPressure()) {
+      triggerFault("Sensor failure during inflation.");
+      return false;
+    }
+
+    if (pressureMMHg >= MAX_PRESSURE) {
+      triggerFault("Maximum pressure reached.");
+      return false;
+    }
+
+    // Detect the first reading at or above 80 mmHg.
+    if (!targetReached &&
+        pressureMMHg >= INFLATION_TARGET) {
+
+      targetReached = true;
+      targetReachedTime = millis();
+
+      Serial.println();
+      Serial.println("80 mmHg REACHED.");
+
+      Serial.printf(
+        "Pressure at threshold: %.3f mmHg\n",
+        pressureMMHg
+      );
+
+      Serial.printf(
+        "Keeping pump ON for another %lu ms.\n",
+        (unsigned long)POST_TARGET_PUMP_MS
+      );
+    }
+
+    // Continue pumping for one second after the threshold.
+    if (targetReached) {
+
+      if (millis() - targetReachedTime >=
+          POST_TARGET_PUMP_MS) {
+
+        pumpOff();
+
+        pumpOffTimeUs = micros();
+
+        sampleCount = 0;
+
+        if (!storeSample(0, pressureMMHg, rawReading)) {
+          triggerFault("Sample buffer error.");
+          return false;
+        }
+
+        Serial.println();
+        Serial.println("POST-TARGET INFLATION COMPLETE.");
+
+        Serial.printf(
+          "Final pump-off pressure: %.3f mmHg\n",
+          pressureMMHg
+        );
+
+        Serial.println("Pump OFF.");
+        Serial.println("Valve CLOSED.");
+        Serial.println("Beginning passive pressure recording.");
+
+        Serial.println();
+        Serial.println("ELAPSED_MS,PRESSURE_MMHG,RAW");
+
+        Serial.printf(
+          "0,%.3f,%ld\n",
+          pressureMMHg,
+          (long)rawReading
+        );
+
+        return true;
+      }
+
+      // Report pressure while the pump is still running.
+      if (millis() - lastPrint >= 250UL) {
+
+        Serial.printf(
+          "Post-target pumping: %.3f mmHg | %lu ms remaining\n",
+          pressureMMHg,
+          (unsigned long)(
+            POST_TARGET_PUMP_MS -
+            (millis() - targetReachedTime)
+          )
+        );
+
+        lastPrint = millis();
+      }
+    }
+
+    else if (millis() - lastPrint >= 1000UL) {
+
+      Serial.printf(
+        "Inflation: %.3f mmHg\n",
+        pressureMMHg
+      );
+
+      lastPrint = millis();
+    }
+
+    delay(1);
+  }
+
+  triggerFault("Inflation timeout.");
+
+  return false;
+}
+
+// =====================================================
+// PASSIVE DEFLATION RECORDING
+// =====================================================
+
+bool recordPassiveDeflation() {
+
+  Serial.println();
+  Serial.println("PASSIVE DEFLATION STARTED");
+  Serial.println("Pump remains OFF.");
+  Serial.println("Valve remains CLOSED.");
+  Serial.println("No pressure corrections will be made.");
+
+  bool reachedTarget = false;
+
+  uint32_t elapsedUs = 0;
+
+  while (elapsedUs < MAX_DEFLATION_MS * 1000UL) {
+
+    pollSerial();
+
+    if (stopRequested) {
+      Serial.println("Recording interrupted by STOP.");
+      break;
+    }
+
+    if (!readPressure()) {
+      triggerFault("Sensor failure during passive deflation.");
+      break;
+    }
+
+    elapsedUs = micros() - pumpOffTimeUs;
+
+    if (pressureMMHg >= MAX_PRESSURE) {
+      triggerFault("Pressure safety limit exceeded.");
+      break;
+    }
+
+    if (!storeSample(elapsedUs, pressureMMHg, rawReading)) {
+      triggerFault("Sample buffer full.");
+      break;
+    }
+
+    Serial.printf(
+      "%lu,%.3f,%ld\n",
+      (unsigned long)(elapsedUs / 1000UL),
+      pressureMMHg,
+      (long)rawReading
+    );
+
+    if (pressureMMHg <= DEFLATION_TARGET) {
+
+      reachedTarget = true;
+
+      Serial.println();
+      Serial.println("60 mmHg REACHED.");
+
+      break;
+    }
+  }
+
+  if (!reachedTarget &&
+      !stopRequested &&
+      !systemFault) {
+
+    Serial.println();
+    Serial.println("DEFLATION TIMEOUT.");
+    Serial.println("60 mmHg was not reached within 30 seconds.");
+  }
+
+  safeState();
+
+  return reachedTarget;
 }
 
 // =====================================================
@@ -256,7 +596,8 @@ bool inflateToTarget() {
 
 bool releasePressure() {
 
-  Serial.println("RELEASING PRESSURE...");
+  Serial.println();
+  Serial.println("Opening valve and releasing pressure...");
 
   pumpOff();
   valveOpen();
@@ -265,208 +606,481 @@ bool releasePressure() {
 
   while (millis() - startTime < MAX_RELEASE_MS) {
 
+    pollSerial();
+
     if (stopRequested) {
       safeState();
       return false;
     }
 
     if (!readPressure()) {
-      safeState();
-      systemFault = true;
-      Serial.println("SYSTEM FAULT: Sensor failure during release.");
+      triggerFault("Sensor failure during pressure release.");
       return false;
     }
 
     if (pressureMMHg <= RELEASE_TARGET) {
-      Serial.println("Pressure released.");
+
+      Serial.printf(
+        "Pressure released: %.3f mmHg\n",
+        pressureMMHg
+      );
+
       return true;
     }
 
-    delay(10);
+    delay(2);
   }
 
-  safeState();
-  systemFault = true;
-  Serial.println("SYSTEM FAULT: Release timeout.");
+  triggerFault("Pressure release timeout.");
 
   return false;
 }
 
 // =====================================================
-// RUN ONE TEST
+// CALCULATE REGRESSION FOR A TIME WINDOW
 // =====================================================
 
-bool runTest(uint8_t mode) {
+void calculateWindow(
+  float startSeconds,
+  float endSeconds
+) {
 
-  if (!inflateToTarget()) return false;
+  windowCount = 0;
 
-  Serial.println();
-  Serial.println("-----------------------------------------------");
-  Serial.printf("CYCLE: %lu\n", (unsigned long)cycleNumber);
-  Serial.printf("TEST: %s\n", testNames[mode]);
-  Serial.println("PUMP AND VALVE TEST STARTED");
-  Serial.println("-----------------------------------------------");
+  windowRegressionRate = NAN;
+  windowAverageRate = NAN;
+  windowRSquared = NAN;
+  windowMaxResidual = NAN;
 
-  // Valve remains continuously open throughout the test.
-  valveOpen();
+  windowFirstPressure = NAN;
+  windowLastPressure = NAN;
+  windowDuration = NAN;
 
-  uint32_t startTime = millis();
-  uint32_t lastSample = 0;
+  double sumT = 0;
+  double sumP = 0;
+  double sumTT = 0;
+  double sumTP = 0;
 
-  float startPressure = pressureMMHg;
-  float minPressure = pressureMMHg;
-  float maxPressure = pressureMMHg;
+  double firstT = 0;
+  double lastT = 0;
 
-  uint32_t sampleCount = 0;
+  for (int i = 0; i < sampleCount; i++) {
 
-  Serial.println();
-  Serial.println(
-    "CYCLE,TEST,ELAPSED_MS,PRESSURE_MMHG,RAW,PUMP_ON,VALVE_OPEN"
-  );
+    double t =
+        samples[i].timeUs / 1000000.0;
 
-  while (millis() - startTime < TEST_DURATION_MS) {
+    double p = samples[i].pressure;
 
-    if (stopRequested || systemFault) {
-      safeState();
-      return false;
+    if (t < startSeconds || t > endSeconds) {
+      continue;
     }
 
-    uint32_t elapsed = millis() - startTime;
+    if (windowCount == 0) {
 
-    // Pump operating mode
-    if (mode == BASELINE) {
-      pumpOff();
+      windowFirstPressure = p;
+      firstT = t;
     }
 
-    else if (mode == CONTINUOUS) {
-      pumpOn();
-    }
+    windowLastPressure = p;
+    lastT = t;
 
-    else if (mode == PULSED) {
-      if ((elapsed % 2000UL) < 1000UL) {
-        pumpOn();
-      } else {
-        pumpOff();
-      }
-    }
+    sumT += t;
+    sumP += p;
+    sumTT += t * t;
+    sumTP += t * p;
 
-    if (elapsed - lastSample >= SAMPLE_INTERVAL_MS) {
-
-      if (!checkSafety()) return false;
-
-      elapsed = millis() - startTime;
-
-      if (pressureMMHg < minPressure) {
-        minPressure = pressureMMHg;
-      }
-
-      if (pressureMMHg > maxPressure) {
-        maxPressure = pressureMMHg;
-      }
-
-      bool pumpState = digitalRead(PUMP_EN) == HIGH;
-
-      Serial.printf(
-        "%lu,%s,%lu,%.3f,%ld,%d,1\n",
-        (unsigned long)cycleNumber,
-        testNames[mode],
-        (unsigned long)elapsed,
-        pressureMMHg,
-        (long)rawReading,
-        pumpState ? 1 : 0
-      );
-
-      sampleCount++;
-      lastSample = elapsed;
-    }
-
-    delay(5);
+    windowCount++;
   }
 
-  pumpOff();
-  valveOpen();
-
-  float endPressure = pressureMMHg;
-  float duration = (millis() - startTime) / 1000.0f;
-  float netRate = (startPressure - endPressure) / duration;
-
-  Serial.println();
-  Serial.println("---------- TEST SUMMARY ----------");
-
-  Serial.printf("Test            : %s\n", testNames[mode]);
-  Serial.printf("Start pressure  : %.3f mmHg\n", startPressure);
-  Serial.printf("End pressure    : %.3f mmHg\n", endPressure);
-  Serial.printf("Minimum pressure: %.3f mmHg\n", minPressure);
-  Serial.printf("Maximum pressure: %.3f mmHg\n", maxPressure);
-  Serial.printf("Pressure change : %.3f mmHg\n",
-                endPressure - startPressure);
-  Serial.printf("Net decay rate  : %.3f mmHg/s\n", netRate);
-  Serial.printf("Duration        : %.2f s\n", duration);
-  Serial.printf("Samples         : %lu\n",
-                (unsigned long)sampleCount);
-
-  Serial.println("----------------------------------");
-
-  return true;
-}
-
-// =====================================================
-// COMPLETE CONTINUOUS TEST SEQUENCE
-// =====================================================
-
-void runAllTests() {
-
-  if (systemFault) {
-    Serial.println("System fault. Reset required.");
+  if (windowCount < 3) {
     return;
   }
 
-  testRunning = true;
-  stopRequested = false;
+  double n = windowCount;
 
-  Serial.println();
-  Serial.println("==============================================");
-  Serial.println("PUMP + OPEN VALVE CHARACTERIZATION");
-  Serial.println("A: Pump OFF");
-  Serial.println("B: Pump continuously ON");
-  Serial.println("C: Pump pulsed 1s ON / 1s OFF");
-  Serial.println("Each test: 80 mmHg start, 10s recording");
-  Serial.println("==============================================");
+  double denominator =
+      n * sumTT - sumT * sumT;
 
-  while (!systemFault && !stopRequested) {
+  if (fabs(denominator) < 1e-12) {
+    return;
+  }
 
-    cycleNumber++;
+  double slope =
+      (n * sumTP - sumT * sumP) / denominator;
 
-    for (uint8_t i = 0; i < 3; i++) {
+  double intercept =
+      (sumP - slope * sumT) / n;
 
-      if (systemFault || stopRequested) break;
+  windowRegressionRate = (float)(-slope);
 
-      if (!runTest(i)) break;
+  windowDuration = (float)(lastT - firstT);
 
-      if (systemFault || stopRequested) break;
+  if (windowDuration > 0) {
 
-      if (!releasePressure()) break;
+    windowAverageRate =
+        (windowFirstPressure - windowLastPressure) /
+        windowDuration;
+  }
 
-      delay(1000);
+  double meanP = sumP / n;
+
+  double totalVariation = 0;
+  double residualVariation = 0;
+  double maxResidual = 0;
+
+  for (int i = 0; i < sampleCount; i++) {
+
+    double t =
+        samples[i].timeUs / 1000000.0;
+
+    double p = samples[i].pressure;
+
+    if (t < startSeconds || t > endSeconds) {
+      continue;
     }
 
-    if (!systemFault && !stopRequested) {
-      Serial.println();
-      Serial.printf("CYCLE %lu COMPLETED\n",
-                    (unsigned long)cycleNumber);
+    double predicted = intercept + slope * t;
+
+    double residual = p - predicted;
+
+    totalVariation +=
+        (p - meanP) * (p - meanP);
+
+    residualVariation +=
+        residual * residual;
+
+    if (fabs(residual) > maxResidual) {
+      maxResidual = fabs(residual);
     }
   }
 
-  safeState();
-  testRunning = false;
+  if (totalVariation > 1e-12) {
+
+    windowRSquared =
+        (float)(1.0 - residualVariation / totalVariation);
+  }
+
+  windowMaxResidual = (float)maxResidual;
+}
+
+// =====================================================
+// PRINT WINDOW STATISTICS
+// =====================================================
+
+void printWindow(
+  const char* name,
+  float startSeconds,
+  float endSeconds
+) {
+
+  calculateWindow(startSeconds, endSeconds);
 
   Serial.println();
-  Serial.println("==============================================");
-  Serial.println("TEST SEQUENCE STOPPED");
-  Serial.printf("Completed cycles: %lu\n",
-                (unsigned long)cycleNumber);
-  Serial.println("Pump OFF. Valve OPEN.");
-  Serial.println("==============================================");
+  Serial.println(name);
+
+  Serial.printf(
+    "  Samples          : %lu\n",
+    (unsigned long)windowCount
+  );
+
+  if (windowCount < 3 ||
+      !isfinite(windowRegressionRate)) {
+
+    Serial.println("  Insufficient data for regression.");
+    return;
+  }
+
+  Serial.printf(
+    "  Regression rate  : %.3f mmHg/s\n",
+    windowRegressionRate
+  );
+
+  Serial.printf(
+    "  Average rate     : %.3f mmHg/s\n",
+    windowAverageRate
+  );
+
+  Serial.printf(
+    "  R-squared        : %.5f\n",
+    windowRSquared
+  );
+
+  Serial.printf(
+    "  Max fit residual : %.3f mmHg\n",
+    windowMaxResidual
+  );
+
+  Serial.printf(
+    "  Pressure change  : %.3f mmHg\n",
+    windowFirstPressure - windowLastPressure
+  );
+
+  Serial.printf(
+    "  Duration         : %.3f s\n",
+    windowDuration
+  );
+}
+
+// =====================================================
+// FIND TIME AT WHICH PRESSURE CROSSES A THRESHOLD
+// =====================================================
+
+bool findCrossingTime(
+  float threshold,
+  float &crossingSeconds
+) {
+
+  if (sampleCount < 2) {
+    return false;
+  }
+
+  if (samples[0].pressure <= threshold) {
+
+    crossingSeconds = 0.0f;
+    return true;
+  }
+
+  for (int i = 1; i < sampleCount; i++) {
+
+    float p1 = samples[i - 1].pressure;
+    float p2 = samples[i].pressure;
+
+    if (p1 > threshold && p2 <= threshold) {
+
+      float t1 =
+          samples[i - 1].timeUs / 1000000.0f;
+
+      float t2 =
+          samples[i].timeUs / 1000000.0f;
+
+      if (fabs(p1 - p2) < 1e-6f) {
+
+        crossingSeconds = t2;
+      }
+
+      else {
+
+        float fraction =
+            (p1 - threshold) / (p1 - p2);
+
+        crossingSeconds =
+            t1 + fraction * (t2 - t1);
+      }
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// =====================================================
+// PRESSURE BAND RATES
+// =====================================================
+
+void printPressureBandRates() {
+
+  const float levels[] = {
+    80.0f, 75.0f, 70.0f, 65.0f, 60.0f
+  };
+
+  float crossingTimes[5];
+  bool crossed[5];
+
+  for (int i = 0; i < 5; i++) {
+
+    crossed[i] =
+        findCrossingTime(levels[i], crossingTimes[i]);
+  }
+
+  Serial.println();
+  Serial.println("========== PRESSURE BAND RATES ==========");
+  Serial.println("BAND       | DURATION | RATE");
+
+  for (int i = 0; i < 4; i++) {
+
+    Serial.printf(
+      "%.0f-%.0f    | ",
+      levels[i],
+      levels[i + 1]
+    );
+
+    if (!crossed[i] || !crossed[i + 1]) {
+
+      Serial.println("Not completed");
+      continue;
+    }
+
+    float duration =
+        crossingTimes[i + 1] - crossingTimes[i];
+
+    if (duration <= 0) {
+
+      Serial.println("Invalid crossing times");
+      continue;
+    }
+
+    float rate = 5.0f / duration;
+
+    Serial.printf(
+      "%.3f s  | %.3f mmHg/s\n",
+      duration,
+      rate
+    );
+  }
+
+  Serial.println("=========================================");
+}
+
+// =====================================================
+// COMPLETE ANALYSIS
+// =====================================================
+
+void printAnalysis() {
+
+  if (sampleCount < 3) {
+
+    Serial.println("Insufficient data for analysis.");
+    return;
+  }
+
+  float endSeconds =
+      samples[sampleCount - 1].timeUs / 1000000.0f;
+
+  Serial.println();
+  Serial.println();
+  Serial.println("============================================");
+  Serial.println("         PASSIVE DEFLATION ANALYSIS");
+  Serial.println("============================================");
+
+  Serial.printf(
+    "Pump-off pressure : %.3f mmHg\n",
+    samples[0].pressure
+  );
+
+  Serial.printf(
+    "Final pressure    : %.3f mmHg\n",
+    samples[sampleCount - 1].pressure
+  );
+
+  Serial.printf(
+    "Total pressure drop: %.3f mmHg\n",
+    samples[0].pressure -
+    samples[sampleCount - 1].pressure
+  );
+
+  Serial.printf(
+    "Recording time    : %.3f s\n",
+    endSeconds
+  );
+
+  Serial.printf(
+    "Total samples     : %d\n",
+    sampleCount
+  );
+
+  Serial.println();
+  Serial.println("INITIAL POST-PUMP-OFF CHANGE");
+
+  if (sampleCount >= 2) {
+
+    Serial.printf(
+      "First sample time : %.3f ms\n",
+      samples[1].timeUs / 1000.0f
+    );
+
+    Serial.printf(
+      "First sample      : %.3f mmHg\n",
+      samples[1].pressure
+    );
+
+    Serial.printf(
+      "Initial pressure change: %.3f mmHg\n",
+      samples[0].pressure -
+      samples[1].pressure
+    );
+  }
+
+  Serial.println();
+  Serial.println("TIME-BASED REGRESSION");
+
+  printWindow(
+    "INITIAL: 0 - 0.5 seconds",
+    0.0f,
+    0.5f
+  );
+
+  printWindow(
+    "SETTLING: 0.5 - 2 seconds",
+    0.5f,
+    2.0f
+  );
+
+  printWindow(
+    "SUBSEQUENT: 2 seconds onward",
+    2.0f,
+    endSeconds + 0.01f
+  );
+
+  Serial.println();
+  Serial.println("OVERALL REGRESSION");
+
+  printWindow(
+    "COMPLETE RECORDING",
+    0.0f,
+    endSeconds + 0.01f
+  );
+
+  printPressureBandRates();
+
+  Serial.println();
+  Serial.println("============================================");
+  Serial.println("END OF ANALYSIS");
+  Serial.println("============================================");
+}
+
+// =====================================================
+// COMPLETE TEST
+// =====================================================
+
+bool runPassiveTest() {
+
+  sampleCount = 0;
+
+  if (!ventBeforeRun()) {
+    return false;
+  }
+
+  if (!inflateAndStartCapture()) {
+    return false;
+  }
+
+  bool reachedTarget =
+      recordPassiveDeflation();
+
+  if (!stopRequested && !systemFault) {
+    releasePressure();
+  }
+
+  printAnalysis();
+
+  Serial.println();
+
+  if (reachedTarget && !systemFault && !stopRequested) {
+    Serial.println("PASSIVE DEFLATION TEST COMPLETED.");
+  }
+
+  else if (stopRequested) {
+    Serial.println("TEST STOPPED BY USER.");
+  }
+
+  else if (!systemFault) {
+    Serial.println("TEST ENDED WITHOUT REACHING 60 mmHg.");
+  }
+
+  safeState();
+
+  return reachedTarget && !systemFault && !stopRequested;
 }
 
 // =====================================================
@@ -505,7 +1119,7 @@ void setup() {
 
     safeState();
 
-    Serial.println("HX710B initialization failed!");
+    Serial.println("HX710B initialization failed.");
 
     while (true) {
       delay(1000);
@@ -513,13 +1127,28 @@ void setup() {
   }
 
   Serial.println("HX710B initialized.");
-  Serial.println("Pump OFF. Valve OPEN.");
+
+  Serial.println();
+  Serial.println("============================================");
+  Serial.println("     PASSIVE DEFLATION CHARACTERIZATION");
+  Serial.println("============================================");
+
+  Serial.println("Initial target    : 80 mmHg");
+  Serial.println("Extra pump time   : 1000 ms");
+  Serial.println("Deflation target  : 60 mmHg");
+  Serial.println("Maximum pressure  : 95 mmHg");
+  Serial.println("Pump during test  : OFF");
+  Serial.println("Valve during test : CLOSED");
 
   Serial.println();
   Serial.println("COMMANDS:");
-  Serial.println("RUN  - Start continuous A/B/C tests");
-  Serial.println("STOP - Stop tests and open valve");
+  Serial.println("RUN  - Start test");
+  Serial.println("STOP - Stop pump and open valve");
   Serial.println("HELP - Show commands");
+
+  Serial.println();
+  Serial.println("BENCH TEST ONLY.");
+  Serial.println("Pump OFF. Valve OPEN.");
 }
 
 // =====================================================
@@ -528,39 +1157,36 @@ void setup() {
 
 void loop() {
 
+  pollSerial();
+
   if (systemFault) {
+
     safeState();
+
     delay(100);
     return;
   }
 
-  if (Serial.available()) {
+  if (runRequested && !testRunning) {
 
-    String command = Serial.readStringUntil('\n');
-    command.trim();
-    command.toUpperCase();
+    runRequested = false;
+    stopRequested = false;
 
-    if (command == "RUN") {
+    testRunning = true;
 
-      if (!testRunning) {
-        runAllTests();
-      } else {
-        Serial.println("Tests already running.");
-      }
-    }
+    Serial.println();
+    Serial.println("STARTING PASSIVE DEFLATION TEST.");
 
-    else if (command == "STOP") {
-      stopRequested = true;
-      safeState();
-      Serial.println("STOP REQUESTED.");
-    }
+    runPassiveTest();
 
-    else if (command == "HELP") {
-      Serial.println("RUN  - Start continuous tests");
-      Serial.println("STOP - Stop tests");
-      Serial.println("Pump OFF and valve OPEN when idle.");
-    }
+    testRunning = false;
+
+    safeState();
+
+    Serial.println();
+    Serial.println("SYSTEM IDLE.");
+    Serial.println("Pump OFF. Valve OPEN.");
   }
 
-  delay(5);
+  delay(2);
 }
