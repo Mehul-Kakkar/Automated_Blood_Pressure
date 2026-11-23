@@ -10,6 +10,9 @@ or stops measurement by itself.
 
 Advertised device name: BP Controller (included in the BLE scan response)
 Service: 4b505001-6b70-4c46-9c87-687572617465
+The service UUID and original measurement characteristic table are retained for
+browser permission and GATT-cache compatibility. Batched waveform packets share
+the existing microphone characteristic (...5006).
 
 Characteristics
 ---------------
@@ -18,11 +21,12 @@ UUID suffix  Property      Content
 ...5003      Read/Notify   Controller state, uptime, session, fault, calibration
 ...5004      Read/Notify   Raw pressure counts; mmHg is null until calibrated
 ...5005      Read/Notify   Heart rate; null until actually available
-...5006      Read/Notify   Live microphone sample stream during measurement
+...5006      Read/Notify   Live microphone JSON diagnostics and binary waveform batches
 ...5007      Read/Notify   Progress; unavailable until a validated estimator exists
 ...5008      Write        Phone command JSON
 ...5009      Notify       Command acknowledgement JSON
 ...500a      Read/Notify   Fault code and controller state
+...500b      Encrypted Write/Notify  Wi-Fi scan and provisioning JSON
 
 Commands are UTF-8 JSON, max 128 bytes:
 {"v":1,"command_id":"<UUID>","command":"GET_STATUS"}
@@ -35,12 +39,30 @@ Acknowledgement:
 The command ID matches the request. `ok` is true only when the local command
 manager reports completion. A GATT write acknowledgement alone is not success.
 
+Wi-Fi provisioning uses ...500b with `{"v":1,"command_id":"<UUID>","command":"SCAN_WIFI"}`
+or `{"v":1,"command_id":"<UUID>","command":"SET_WIFI","ssid":"...","password":"..."}`.
+Scan results are individual notifications (`type: network`, `ssid`, `rssi`,
+`secure`), followed by `scan_complete`. Passwords are stored in ESP32 Preferences
+(NVS), never sent to the backend. Configure Wi-Fi only while idle.
+
+Waveform batches arrive on ...5006 as little-endian binary notifications; the
+same characteristic also sends lower-rate JSON diagnostics. Version 1 batches
+use byte 0 version, byte 1 count (up to 80), bytes 2-5 first sequence, bytes 6-9
+first `micros()` timestamp, then signed 16-bit filtered values in Q4. Version 2
+uses the same first ten bytes, followed by a uint16 envelope threshold in Q2,
+then up to 42 records of signed int16 filtered Q4 and uint16 envelope Q2. Divide
+Q4 by 16 and Q2 by 4 for ADC-count units. Version 2's maximum packet is 180
+bytes for the configured MTU 185. The ESP32 detector still processes all samples
+at 2 kHz; sequence gaps are counted in the app and the bounded ring can replay
+recent samples after a brief BLE interruption. JSON diagnostics carry noise
+floor, baseline, calibration mode, pressure, event strength, and duration.
+
 Security and operating limits
 -----------------------------
-This prototype does not configure BLE pairing/bonding or authenticated GATT
-permissions. The phone's browser chooser requires explicit user selection, but
-that is not a substitute for link encryption; do not use this BLE link where
-nearby hostile clients are in scope. Firmware validates protocol/version,
+The Wi-Fi characteristic requires an encrypted bonded BLE link (Just Works
+pairing, without MITM authentication). The phone may show a system pairing prompt
+the first time Wi-Fi configuration is used. The measurement command channel is
+unchanged. Firmware validates protocol/version,
 command names, UUID command IDs, duplicate IDs, state and safety checks. It does
 not expose arbitrary GPIO commands. BLE is for Android Chrome/Web Bluetooth on
 HTTPS (or localhost); iOS Safari does not currently provide the required Web
@@ -57,7 +79,7 @@ Phone test guide
    Connection causes only GET_STATUS; it must not start a measurement.
 4. Send GET_STATUS or REQUEST_LIVE_DATA and confirm a matching command ID ack.
 5. Press Start measurement explicitly. The controller closes the normally-open
-   release valve, inflates to 130 mmHg, then cuts pump power and deenergizes the
+   release valve, inflates to the configured 150 mmHg target (160 mmHg hard cutoff), then cuts pump power and deenergizes the
    valve so cuff pressure falls. A successful GATT write alone is not evidence
    that a measurement started; confirm the resulting state notification.
 6. STOP_MEASUREMENT is handled by the local command manager; it cuts pump power

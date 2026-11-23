@@ -23,8 +23,19 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql+psycopg://bp_user:${POSTGRES_PASSWORD}@postgres:5432/bp_app
-      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
-      MQTT_ENABLED: "false"
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174
+      MQTT_ENABLED: ${MQTT_ENABLED:-false}
+      MQTT_LEGACY_TOPIC_COMPATIBILITY: ${MQTT_LEGACY_TOPIC_COMPATIBILITY:-false}
+      MQTT_BROKER_HOST: ${MQTT_BROKER_HOST:-k7128701.ala.asia-southeast1.emqxsl.com}
+      MQTT_BROKER_PORT: ${MQTT_BROKER_PORT:-8883}
+      MQTT_TLS_ENABLED: ${MQTT_TLS_ENABLED:-true}
+      MQTT_USERNAME: ${MQTT_USERNAME:-bp_backend}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      MQTT_CA_CERT_PATH: ${MQTT_CA_CERT_PATH:-}
+      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-bp_backend_local}
+      MQTT_KEEPALIVE: ${MQTT_KEEPALIVE:-60}
+    volumes:
+      - ./certs:/run/mqtt-ca:ro
     ports:
       - "8000:8000"
     depends_on:

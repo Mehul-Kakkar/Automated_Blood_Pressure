@@ -59,4 +59,53 @@ describe('typed backend API client', () => {
   expect(requests.map(x=>x.url)).toEqual(['https://backend.example.test/api/v1/auth/register','https://backend.example.test/api/v1/auth/login'])
   expect(requests[0].body).toMatchObject({username:'Device_Owner',display_name:'Local Owner'})
  })
+ it('sends logout once with the active bearer token', async () => {
+  const requests:Array<{url:string;authorization:string|null}> = []
+  const api=new BackendApi('https://backend.example.test',async(url,init)=>{requests.push({url:String(url),authorization:new Headers(init?.headers).get('Authorization')});return new Response(null,{status:204})})
+  api.setToken('current-token')
+  await api.logout()
+  expect(requests).toEqual([
+   {url:'https://backend.example.test/api/v1/auth/logout',authorization:'Bearer current-token'},
+  ])
+ })
+ it('uses the issued login token to verify and load the account profile', async () => {
+  const requests:Array<{path:string;authorization:string|null}> = []
+  const auth={access_token:'session-token',token_type:'bearer',expires_at:'2027-01-02T00:00:00Z',username:'device_owner',display_name:'Local Owner'}
+  const profile={username:'device_owner',display_name:'Local Owner',created_at:'2026-01-01T00:00:00Z',avatar_available:false,password_enabled:true}
+  const api=new BackendApi('https://backend.example.test',async(url,init)=>{
+   requests.push({path:new URL(String(url)).pathname,authorization:new Headers(init?.headers).get('Authorization')})
+   return String(url).endsWith('/login')?response(auth):response(profile)
+  })
+  const result=await api.login('device_owner','correct horse battery staple')
+  api.setToken(result.access_token)
+  expect(await api.getProfile()).toMatchObject({username:'device_owner',display_name:'Local Owner'})
+  expect(requests).toEqual([
+   {path:'/api/v1/auth/login',authorization:null},
+   {path:'/api/v1/profile',authorization:'Bearer session-token'},
+  ])
+ })
+ it('enrolls an owner device and tracks the non-actuating status command acknowledgement', async () => {
+  const deviceId='22222222-2222-4222-8222-222222222222'
+  const commandId='44444444-4444-4444-8444-444444444444'
+  const device={id:deviceId,device_identifier:'bp_device_001',hardware_revision:null,firmware_version:null,
+   processing_algorithm_version:null,mqtt_enrolled:true,online:false,reported_state:null,state_reported_at:null,last_seen_at:null,
+   pressure_calibration_confirmed:false,pressure_calibration_version:null}
+  const command={command_id:commandId,command_type:'STATUS_REQUEST',status:'sent',issued_at:'2026-01-01T00:00:00Z',
+   expires_at:'2026-01-01T00:00:30Z',response_code:null,response_state:null}
+  const requests:Array<{path:string;method:string|undefined;body:unknown}> = []
+  const api=new BackendApi('https://backend.example.test',async(url,init)=>{
+   const parsedUrl=new URL(String(url));requests.push({path:parsedUrl.pathname,method:init?.method,body:init?.body?JSON.parse(String(init.body)):undefined})
+   return parsedUrl.pathname.endsWith('/commands/'+commandId)?response({...command,status:'completed',response_state:'idle'}):
+    parsedUrl.pathname.endsWith('/status-request')?response(command,202):response(device)
+  })
+  api.setToken('owner-token')
+  expect((await api.enrollDeviceMqtt(deviceId,'bp_device_001')).mqtt_enrolled).toBe(true)
+  expect((await api.requestDeviceStatus(deviceId)).status).toBe('sent')
+  expect((await api.getDeviceCommand(deviceId,commandId)).status).toBe('completed')
+  expect(requests).toEqual([
+   {path:`/api/v1/devices/${deviceId}/mqtt-enrollment`,method:'POST',body:{mqtt_principal:'bp_device_001'}},
+   {path:`/api/v1/devices/${deviceId}/status-request`,method:'POST',body:undefined},
+   {path:`/api/v1/devices/${deviceId}/commands/${commandId}`,method:undefined,body:undefined},
+  ])
+ })
 })

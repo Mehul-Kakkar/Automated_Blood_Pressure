@@ -29,6 +29,10 @@ class TelemetrySampleInput(StrictPayload):
     acoustic_envelope: Decimal | None = Field(default=None, ge=0, allow_inf_nan=False, max_digits=12, decimal_places=4)
     noise_floor: Decimal | None = Field(default=None, ge=0, allow_inf_nan=False, max_digits=12, decimal_places=4)
     threshold: Decimal | None = Field(default=None, ge=0, allow_inf_nan=False, max_digits=12, decimal_places=4)
+    adc_baseline: Decimal | None = Field(default=None, ge=0, le=4095, allow_inf_nan=False, max_digits=7, decimal_places=3)
+    sample_rate_hz: int | None = Field(default=None, ge=1, le=10000)
+    calibration_mode: Literal["unknown", "unpressurized_pump_stopped", "pressurized_pump_stopped", "active_deflation", "pump_inflating"] | None = None
+    calibrated: bool | None = None
     event_detected: bool | None = None
     is_valid: bool = True
     quality_flags: list[str] = Field(default_factory=list, max_length=16)

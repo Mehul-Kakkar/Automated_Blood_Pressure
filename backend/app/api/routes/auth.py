@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -15,6 +16,7 @@ from app.db.session import get_db_session
 from app.models import Owner, OwnerCredential
 from app.schemas.auth import AuthResponse, CredentialsRequest, RegistrationRequest
 from app.security.passwords import hash_password, verify_password
+from app.security.auth import bearer_scheme
 
 router = APIRouter(prefix="/api/v1/auth", tags=["authentication"])
 Db = Annotated[Session, Depends(get_db_session)]
@@ -65,3 +67,38 @@ def login(body: CredentialsRequest, db: Db) -> AuthResponse:
     result = _issue_credential(db, owner)
     db.commit()
     return result
+
+
+def _active_credential(db: Session, credentials: HTTPAuthorizationCredentials | None) -> OwnerCredential:
+    if credentials is None or credentials.scheme.lower() != "bearer" or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Bearer authentication is required.")
+    digest = hashlib.sha256(credentials.credentials.encode("utf-8")).hexdigest()
+    credential = db.scalar(select(OwnerCredential).where(
+        OwnerCredential.token_sha256 == digest,
+        OwnerCredential.revoked_at.is_(None),
+        (OwnerCredential.expires_at.is_(None) | (OwnerCredential.expires_at > datetime.now(timezone.utc))),
+    ))
+    if credential is None:
+        raise HTTPException(status_code=401, detail="Invalid bearer credential.")
+    return credential
+
+
+@router.post("/refresh", response_model=AuthResponse)
+def refresh(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)], db: Db) -> AuthResponse:
+    """Rotate a still-valid bearer token; the old token becomes unusable."""
+    current = _active_credential(db, credentials)
+    owner = db.get(Owner, current.owner_username)
+    if owner is None:
+        raise HTTPException(status_code=401, detail="Account no longer exists.")
+    current.revoked_at = datetime.now(timezone.utc)
+    result = _issue_credential(db, owner)
+    db.commit()
+    return result
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+def logout(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)], db: Db) -> None:
+    """Revoke the current server-side session credential."""
+    current = _active_credential(db, credentials)
+    current.revoked_at = datetime.now(timezone.utc)
+    db.commit()

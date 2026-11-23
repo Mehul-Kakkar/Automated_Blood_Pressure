@@ -41,6 +41,25 @@ describe('session commands', () => {
     expect(JSON.parse(localStorage.getItem('pulsefield.ble.sessions.v1') ?? '[]')).toHaveLength(1)
   })
 
+  it('shows the batch-derived envelope and adaptive threshold, and counts missing waveform samples', async () => {
+    let notify: ((event: PhoneBleEvent) => void) | undefined
+    vi.spyOn(phoneBle, 'connect').mockImplementation(async listener => { notify = listener; return 'BP Controller' })
+    vi.spyOn(phoneBle, 'send').mockResolvedValue(undefined)
+    useAppStore.setState({ sessions: [], state: 'disconnected', apiToken: undefined, backendAvailable: false, deviceOnline: false })
+    await useAppStore.getState().connectPhone()
+    notify?.({ kind: 'state', value: { state: 'idle', fault: 'none' } })
+    await useAppStore.getState().startFromHome()
+    notify?.({ kind: 'state', value: { state: 'measuring', fault: 'none' } })
+    notify?.({ kind: 'korotkoff', value: { device_timestamp_ms: 1000, raw_adc: 2048, filtered: 0, envelope: 1, noise_floor: 0.5, threshold: 2, adc_baseline: 2048, sample_rate_hz: 2000, calibrated: true, calibration_mode: 'active_deflation', event_detected: false, pressure_valid: false } })
+    notify?.({ kind: 'waveform', value: { version: 2, firstSequence: 10, firstTimestampUs: 500000, samples: [{ filtered: 0, envelope: 0, threshold: 2 }, { filtered: 4, envelope: 1, threshold: 2 }, { filtered: 8, envelope: 2, threshold: 2 }] } })
+    notify?.({ kind: 'waveform', value: { version: 1, firstSequence: 15, firstTimestampUs: 502500, samples: [0, -4] } })
+    const state = useAppStore.getState()
+    expect(state.bleWaveformSamples).toHaveLength(5)
+    expect(state.bleWaveformSamples[1]).toMatchObject({ detectionThreshold: 2, acousticEnvelope: 1, noiseFloor: 0.5, adcBaseline: 2048, sampleRateHz: 2000 })
+    expect(state.bleWaveformDroppedSamples).toBe(2)
+    notify?.({ kind: 'state', value: { state: 'completed', fault: 'none' } })
+  })
+
   it('offers a reset command for a BLE fault and waits for the controller idle report', async () => {
     let notify: ((event: PhoneBleEvent) => void) | undefined
     const send = vi.spyOn(phoneBle, 'send').mockResolvedValue(undefined)

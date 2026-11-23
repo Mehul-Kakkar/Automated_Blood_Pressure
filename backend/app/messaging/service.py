@@ -23,7 +23,7 @@ from app.messaging.schemas import (
     DeviceStatusMessage,
     TelemetryEnvelope,
 )
-from app.messaging.topics import DeviceTopic, device_topic, parse_device_topic
+from app.messaging.topics import DeviceTopic, device_topic, legacy_device_topic, parse_device_topic
 from app.messaging.transport import IncomingMessage, MQTTTransport, PahoMQTTTransport
 from app.models import Device, DeviceCommand, DeviceCommandStatus, MeasurementSession, SessionEvent, TelemetrySample
 from app.schemas.telemetry import TelemetryBatchInput
@@ -98,10 +98,16 @@ class QueuedMessage:
     payload: bytes
     qos: int
     mid: int
+    retained: bool = False
 
 
 class MessagingService:
     SUBSCRIPTIONS = [
+        ("bp/devices/+/telemetry", 1),
+        ("bp/devices/+/status", 1),
+        ("bp/devices/+/ack", 1),
+    ]
+    LEGACY_SUBSCRIPTIONS = [
         ("bp/v1/devices/+/telemetry", 1),
         ("bp/v1/devices/+/status", 1),
         ("bp/v1/devices/+/responses", 1),
@@ -121,9 +127,11 @@ class MessagingService:
         self.command_authorizer = command_authorizer or DenyAllCommandAuthorizer()
         self._queue: queue.Queue[QueuedMessage] = queue.Queue(maxsize=settings.mqtt_queue_size)
         self._client: MQTTTransport | None = None
+        self._subscription_mids: dict[int, tuple[str, ...]] = {}
         self._worker: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        self._legacy_device_ids: set[UUID] = set()
         self._enabled = settings.mqtt_configured
         self._connected = False
         self._last_connection_at: datetime | None = None
@@ -134,6 +142,7 @@ class MessagingService:
         self._oversize_count = 0
         self._queue_full_count = 0
         self._processing_error_count = 0
+        self._started = False
 
     @property
     def health(self) -> dict[str, object]:
@@ -164,11 +173,17 @@ class MessagingService:
             return
         if self.session_factory is None:
             raise RuntimeError("MQTT requires a configured database session factory.")
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
         try:
             client = self.transport_factory()
             client.on_connect = self._on_connect
             client.on_disconnect = self._on_disconnect
             client.on_message = self._on_message
+            if hasattr(client, "on_subscribe"):
+                client.on_subscribe = self._on_subscribe
             self._client = client
             self._worker = threading.Thread(target=self._worker_loop, name="mqtt-ingestion", daemon=True)
             self._worker.start()
@@ -208,16 +223,47 @@ class MessagingService:
                 self._connected = False
             logger.warning("mqtt_connect_rejected", extra={"event": "mqtt_connect_rejected"})
             return
-        result = client.subscribe(self.SUBSCRIPTIONS)
+        subscriptions = self.SUBSCRIPTIONS + (
+            self.LEGACY_SUBSCRIPTIONS if self.settings.mqtt_legacy_topic_compatibility else []
+        )
+        result = client.subscribe(subscriptions)
         rc = result[0] if isinstance(result, tuple) else result
         if rc not in (0, None):
             with self._lock:
                 self._connected = False
             logger.warning("mqtt_subscribe_failed", extra={"event": "mqtt_subscribe_failed"})
             return
+        if isinstance(result, tuple) and len(result) > 1:
+            with self._lock:
+                self._subscription_mids[int(result[1])] = tuple(topic for topic, _qos in subscriptions)
         with self._lock:
             self._connected = True
             self._last_connection_at = datetime.now(timezone.utc)
+
+    def _on_subscribe(
+        self, _client: MQTTTransport, _userdata: object, mid: int, reason_codes: object, _properties: object
+    ) -> None:
+        codes = list(reason_codes) if isinstance(reason_codes, (list, tuple)) else []
+        with self._lock:
+            filters = self._subscription_mids.pop(int(mid), ())
+        failures = []
+        for index, code in enumerate(codes):
+            is_failure = getattr(code, "is_failure", None)
+            if is_failure is None:
+                try:
+                    is_failure = int(code) >= 128
+                except (TypeError, ValueError):
+                    is_failure = True
+            if is_failure:
+                failures.append({"filter": filters[index] if index < len(filters) else "unknown", "reason": str(code)})
+        if failures:
+            logger.error(
+                "mqtt_subscription_rejected",
+                extra={"event": "mqtt_subscription_rejected", "rejected_filters": failures},
+            )
+            if len(failures) == len(filters) and filters:
+                with self._lock:
+                    self._connected = False
 
     def _on_disconnect(self, _client: MQTTTransport, _userdata: object, *_args: object) -> None:
         with self._lock:
@@ -234,7 +280,7 @@ class MessagingService:
             logger.warning("mqtt_payload_too_large", extra={"event": "mqtt_payload_too_large"})
             client.ack(message.mid, message.qos)
             return
-        item = QueuedMessage(message.topic, payload, message.qos, message.mid)
+        item = QueuedMessage(message.topic, payload, message.qos, message.mid, bool(getattr(message, "retain", False)))
         try:
             self._queue.put_nowait(item)
         except queue.Full:
@@ -276,12 +322,15 @@ class MessagingService:
     def _process_queued(self, item: QueuedMessage) -> None:
         try:
             self._handle_message(item)
-        except MessageRejected:
+        except MessageRejected as exc:
             with self._lock:
                 self._rejected_count += 1
             if self._client is not None:
                 self._client.ack(item.mid, item.qos)
-            logger.warning("mqtt_message_rejected", extra={"event": "mqtt_message_rejected"})
+            logger.warning(
+                "mqtt_message_rejected",
+                extra={"event": "mqtt_message_rejected", "reason": str(exc)},
+            )
         except Exception:
             # Preserve broker redelivery by not acknowledging a transient database failure.
             with self._lock:
@@ -304,25 +353,40 @@ class MessagingService:
             raise MessageRejected("Malformed topic or JSON payload.") from exc
         if not isinstance(body, dict):
             raise MessageRejected("MQTT payload must be a JSON object.")
+        if item.retained:
+            raise MessageRejected("Retained device messages are not accepted as live telemetry or status.")
+        if topic.legacy:
+            with self._lock:
+                self._legacy_device_ids.add(UUID(topic.device_id))
         if topic.kind == "telemetry":
             self._handle_telemetry(topic, body)
         elif topic.kind == "status":
             self._handle_status(topic, body)
-        elif topic.kind == "responses":
+        elif topic.kind in {"ack", "responses"}:
             self._handle_response(topic, body)
         else:
             raise MessageRejected("Backend does not accept messages on command topics.")
 
     def _require_enrolled_device(
-        self, db: Session, topic_device_id: UUID, payload_device_id: UUID, *, lock: bool = False
+        self, db: Session, topic: DeviceTopic, payload_device_id: UUID, *, lock: bool = False
     ) -> Device:
-        if topic_device_id != payload_device_id:
-            raise DeviceIdentityRejected("Device ID does not match topic identity.")
-        statement = select(Device).where(Device.id == topic_device_id)
+        if topic.legacy:
+            try:
+                legacy_id = UUID(topic.device_id)
+            except ValueError as exc:
+                raise DeviceIdentityRejected("Legacy MQTT topic does not contain a device UUID.") from exc
+            statement = select(Device).where(Device.id == legacy_id)
+        else:
+            statement = select(Device).where(Device.mqtt_principal == topic.device_id)
         if lock:
             statement = statement.with_for_update()
         device = db.scalar(statement)
-        if device is None or not device.mqtt_enabled or device.mqtt_principal != str(topic_device_id):
+        if (
+            device is None
+            or not device.mqtt_enabled
+            or device.id != payload_device_id
+            or (not topic.legacy and device.mqtt_principal != topic.device_id)
+        ):
             raise DeviceIdentityRejected("Device is not enrolled for MQTT messaging.")
         return device
 
@@ -333,11 +397,9 @@ class MessagingService:
             envelope = TelemetryEnvelope.model_validate(body)
         except Exception as exc:
             raise MessageRejected("Telemetry schema validation failed.") from exc
-        if envelope.payload.device_id != topic.device_id:
-            raise DeviceIdentityRejected("Telemetry payload device does not match topic device.")
         now = datetime.now(timezone.utc)
         with self.session_factory() as db:
-            device = self._require_enrolled_device(db, topic.device_id, envelope.payload.device_id)
+            device = self._require_enrolled_device(db, topic, envelope.payload.device_id)
             if any(sample.pressure_mmhg is not None for sample in envelope.payload.samples) and not (
                 device.pressure_calibration_confirmed and device.pressure_calibration_version
             ):
@@ -374,7 +436,7 @@ class MessagingService:
             )
         with self.session_factory() as db:
             with db.begin():
-                device = self._require_enrolled_device(db, topic.device_id, envelope.payload.device_id)
+                device = self._require_enrolled_device(db, topic, envelope.payload.device_id)
                 device.last_seen_at = datetime.now(timezone.utc)
                 if envelope.payload.firmware_version:
                     device.firmware_version = envelope.payload.firmware_version
@@ -392,7 +454,7 @@ class MessagingService:
             self._handle_device_start_request(topic, status)
         with self.session_factory() as db:
             with db.begin():
-                device = self._require_enrolled_device(db, topic.device_id, status.device_id, lock=True)
+                device = self._require_enrolled_device(db, topic, status.device_id, lock=True)
                 measurement_session = None
                 if status.session_id is not None:
                     measurement_session = db.get(MeasurementSession, status.session_id)
@@ -410,7 +472,31 @@ class MessagingService:
                         SessionEvent.device_id == device.id, SessionEvent.event_type == "device_status"
                     )
                 )
-                out_of_order = prior_sequence is not None and status.sequence <= prior_sequence
+                prior_status = db.scalar(
+                    select(SessionEvent)
+                    .where(SessionEvent.device_id == device.id, SessionEvent.event_type == "device_status")
+                    .order_by(SessionEvent.id.desc())
+                    .limit(1)
+                )
+                previous_uptime = prior_status.data.get("device_uptime_ms") if prior_status else None
+                rebooted = bool(
+                    status.device_uptime_ms is not None
+                    and isinstance(previous_uptime, int)
+                    and status.device_uptime_ms < previous_uptime
+                )
+                prior_state_at = device.state_reported_at
+                if prior_state_at is not None and prior_state_at.tzinfo is None:
+                    prior_state_at = prior_state_at.replace(tzinfo=timezone.utc)
+                heartbeat_stale = prior_state_at is None or prior_state_at < datetime.now(timezone.utc) - timedelta(
+                    seconds=self.settings.device_state_max_age_seconds
+                )
+                rebooted = rebooted or bool(
+                    prior_sequence is not None
+                    and status.sequence < prior_sequence
+                    and status.device_uptime_ms is not None
+                    and heartbeat_stale
+                )
+                out_of_order = prior_sequence is not None and status.sequence <= prior_sequence and not rebooted
                 previous_lost_count = device.reported_lost_sample_count
                 if not out_of_order:
                     device.reported_state = status.state.value
@@ -460,6 +546,7 @@ class MessagingService:
                     device_recorded_at=status.reported_at,
                     data={
                         "state": status.state.value,
+                        "device_uptime_ms": status.device_uptime_ms,
                         "lost_sample_count": status.lost_sample_count,
                         "lost_sample_delta": lost_sample_delta,
                         "out_of_order": out_of_order,
@@ -490,12 +577,13 @@ class MessagingService:
         if self.session_factory is None or status.start_request_id is None:
             raise RuntimeError("Database or start request is unavailable.")
         dispatch_session_id: UUID | None = None
+        dispatch_device_id: UUID | None = None
         owner_username: str | None = None
         request_event_id = uuid5(status.start_request_id, "device-start-request")
         active_lifecycles = {"created", "starting", "measuring", "stopping", "interrupted"}
         with self.session_factory() as db:
             with db.begin():
-                device = self._require_enrolled_device(db, topic.device_id, status.device_id, lock=True)
+                device = self._require_enrolled_device(db, topic, status.device_id, lock=True)
                 if not device.owner_username:
                     raise DeviceIdentityRejected("Device must be associated with an owner before it can request a session.")
                 owner_username = device.owner_username
@@ -554,6 +642,7 @@ class MessagingService:
                     )
                     if existing_start is None:
                         dispatch_session_id = session.id
+                        dispatch_device_id = device.id
 
         # Publish after the session row commits. A failed/uncertain publish is
         # handled by the existing command lifecycle and never reports measuring.
@@ -561,7 +650,7 @@ class MessagingService:
             try:
                 self.publish_command(
                     make_command(
-                        topic.device_id,
+                        dispatch_device_id,
                         dispatch_session_id,
                         DeviceCommandType.START,
                         self.settings.mqtt_command_ttl_seconds,
@@ -578,13 +667,11 @@ class MessagingService:
             response = DeviceCommandResponse.model_validate(body)
         except Exception as exc:
             raise MessageRejected("Command response schema validation failed.") from exc
-        if topic.device_id != response.device_id:
-            raise DeviceIdentityRejected("Command response device does not match topic device.")
         now = datetime.now(timezone.utc)
         expired_response = False
         with self.session_factory() as db:
             with db.begin():
-                device = self._require_enrolled_device(db, topic.device_id, response.device_id)
+                device = self._require_enrolled_device(db, topic, response.device_id)
                 duplicate = db.scalar(
                     select(SessionEvent).where(SessionEvent.device_id == device.id, SessionEvent.event_id == response.response_id)
                 )
@@ -723,9 +810,20 @@ class MessagingService:
                 existing = db.scalar(select(DeviceCommand).where(DeviceCommand.command_id == command.command_id))
                 if existing is not None:
                     raise DuplicateCommandId("Command ID has already been used.")
-                device = self._require_enrolled_device(db, command.device_id, command.device_id)
+                device = db.get(Device, command.device_id)
+                if device is None or not device.mqtt_enabled or not device.mqtt_principal:
+                    raise DeviceIdentityRejected("Device is not enrolled for MQTT messaging.")
                 if owner_username is not None and device.owner_username != owner_username:
                     raise CommandNotAuthorized("Device is not owned by the authenticated API owner.")
+                if not device.mqtt_principal:
+                    raise DeviceIdentityRejected("Device has no MQTT topic identity.")
+                with self._lock:
+                    uses_legacy_topics = device.id in self._legacy_device_ids
+                command_topic = (
+                    legacy_device_topic(device.id, "commands")
+                    if uses_legacy_topics
+                    else device_topic(device.mqtt_principal, "commands")
+                )
                 if command.session_id is not None:
                     measurement_session = db.get(MeasurementSession, command.session_id)
                     if measurement_session is None or measurement_session.device_id != device.id:
@@ -765,7 +863,7 @@ class MessagingService:
         try:
             assert self._client is not None
             self._client.publish(
-                device_topic(command.device_id, "commands"),
+                command_topic,
                 payload,
                 expiry_seconds=max(1, int(ttl)),
                 timeout_seconds=self.settings.mqtt_publish_timeout_seconds,

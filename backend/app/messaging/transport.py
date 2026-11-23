@@ -3,6 +3,7 @@
 import ssl
 from pathlib import Path
 from typing import Any, Callable, Protocol
+from uuid import uuid4
 
 from paho.mqtt import client as mqtt
 from paho.mqtt.packettypes import PacketTypes
@@ -22,6 +23,7 @@ class MQTTTransport(Protocol):
     on_connect: Callable[..., None] | None
     on_disconnect: Callable[..., None] | None
     on_message: Callable[..., None] | None
+    on_subscribe: Callable[..., None] | None
 
     def connect_async(self) -> None: ...
     def loop_start(self) -> None: ...
@@ -55,9 +57,10 @@ class PahoMQTTTransport:
         self.on_connect: Callable[..., None] | None = None
         self.on_disconnect: Callable[..., None] | None = None
         self.on_message: Callable[..., None] | None = None
+        self.on_subscribe: Callable[..., None] | None = None
         self._client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-            client_id=settings.mqtt_client_id,
+            client_id=f"{settings.mqtt_client_id[:116]}-{uuid4().hex[:10]}",
             protocol=mqtt.MQTTv5,
             reconnect_on_failure=True,
             manual_ack=True,
@@ -65,11 +68,13 @@ class PahoMQTTTransport:
         assert settings.mqtt_username is not None and settings.mqtt_password is not None
         self._client.username_pw_set(settings.mqtt_username, settings.mqtt_password.get_secret_value())
         self._client.tls_set_context(tls_context)
+        self._client.reconnect_delay_set(min_delay=1, max_delay=60)
         self._client.max_inflight_messages_set(20)
         self._client.max_queued_messages_set(settings.mqtt_queue_size)
         self._client.on_connect = self._on_connect
         self._client.on_disconnect = self._on_disconnect
         self._client.on_message = self._on_message
+        self._client.on_subscribe = self._on_subscribe
 
     def _on_connect(self, client: Any, userdata: Any, flags: Any, reason_code: Any, properties: Any) -> None:
         if self.on_connect:
@@ -83,9 +88,17 @@ class PahoMQTTTransport:
         if self.on_message:
             self.on_message(client, userdata, message)
 
+    def _on_subscribe(self, client: Any, userdata: Any, mid: int, reason_codes: Any, properties: Any) -> None:
+        if self.on_subscribe:
+            self.on_subscribe(client, userdata, mid, reason_codes, properties)
+
     def connect_async(self) -> None:
         assert self._settings.mqtt_host is not None
-        self._client.connect_async(self._settings.mqtt_host, self._settings.mqtt_port, keepalive=30)
+        self._client.connect_async(
+            self._settings.mqtt_host,
+            self._settings.mqtt_port,
+            keepalive=self._settings.mqtt_keepalive,
+        )
 
     def loop_start(self) -> None:
         self._client.loop_start()

@@ -4,17 +4,22 @@ import { DemoDevice, TelemetrySchema, type Session, type SessionState, type Tele
 import { phoneBle, type PhoneBleEvent } from './ble'
 
 type SyncState = 'not_applicable' | 'pending' | 'synced' | 'uncertain'
+export type WifiNetwork = { ssid: string; rssi: number; secure: boolean }
+const MAX_BLE_WAVEFORM_SAMPLES = 12000
 type Store = {
   demo: boolean; connected: boolean; bleConnected: boolean; deviceOnline: boolean; backendAvailable: boolean; databaseStatus: string
   state: SessionState; samples: Telemetry[]; sessions: Session[]; remoteSessions: RemoteSession[]
   acousticEvents: RemoteAcousticEvent[]; remoteSession?: RemoteSession; devices: Device[]; selectedDeviceId?: string
   startedAt?: number; endedAt?: number; busy: boolean; error?: string; apiToken?: string; sessionSync: SyncState
   startRequestId?: string
-  bleState?: string; blePressureRaw?: number; blePressureMmHg?: number; blePressureSamples: Telemetry[]; bleMicSamples: Telemetry[]; activeBleSessionId?: string; bleFault?: string; bleError?: string; bleConnectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
-  setApiToken: (token?: string) => void; refreshBackend: () => Promise<void>; refreshDevices: () => Promise<void>
+  bleWaveformSamples: Telemetry[]; bleWaveformHistorySamples: Telemetry[]; bleWaveformSampleCount: number; bleWaveformDroppedSamples: number; bleWaveformSupported: boolean
+  wifiNetworks: WifiNetwork[]; wifiStatus?: string
+  bleState?: string; blePressureRaw?: number; blePressureMmHg?: number; bleBloodPressure?: { systolicMmHg: number; diastolicMmHg: number }; blePressureSamples: Telemetry[]; bleMicSamples: Telemetry[]; activeBleSessionId?: string; bleFault?: string; bleError?: string; bleConnectionStage?: string; bleConnectionState: 'disconnected' | 'connecting' | 'connected' | 'reconnecting'
+  setApiToken: (token?: string, expiresAt?: string) => void; refreshBackend: () => Promise<void>; refreshDevices: () => Promise<void>
   selectDevice: (id: string) => void; loadHistory: (offset?: number) => Promise<void>; refreshRemoteSession: () => Promise<RemoteSession | undefined>
   connect: () => Promise<void>; startFromHome: () => Promise<boolean>; start: () => Promise<void>; stop: () => Promise<void>
-  connectPhone: () => Promise<void>; disconnectPhone: () => void; sendPhoneCommand: (command: 'GET_STATUS' | 'START_MEASUREMENT' | 'STOP_MEASUREMENT' | 'RESET_FAULT' | 'REQUEST_LIVE_DATA' | 'GET_DEVICE_INFO') => Promise<void>; resetDeviceFault: () => Promise<void>
+  connectPhone: () => Promise<void>; cancelPhoneConnect: () => void; disconnectPhone: () => void; sendPhoneCommand: (command: 'GET_STATUS' | 'START_MEASUREMENT' | 'STOP_MEASUREMENT' | 'RESET_FAULT' | 'REQUEST_LIVE_DATA' | 'GET_DEVICE_INFO') => Promise<void>; resetDeviceFault: () => Promise<void>
+  scanWifiNetworks: () => Promise<void>; configureWifi: (ssid: string, password: string) => Promise<void>
   resetSession: () => void; addSample: (sample: Telemetry) => void; clearError: () => void; setDemo: (value: boolean) => void
   simulateDisconnect: () => void; simulateFault: () => void; appendRemoteSamples: (samples: RemoteSample[], events: RemoteAcousticEvent[]) => void
 }
@@ -24,11 +29,35 @@ let unsubscribeDemo: (() => void) | undefined
 let remoteAbort: AbortController | undefined
 let liveSessionId: string | undefined
 let lastSampleOffset = 0
+let lastWaveformSequence: number | undefined
 const CONFIRM_TIMEOUT_MS = 20000
 const POLL_INTERVAL_MS = 800
 const MAX_BUFFERED_SAMPLES = 120
 const TELEMETRY_STALE_MS = 15000
 const BLE_SESSION_STORAGE_KEY = 'pulsefield.ble.sessions.v1'
+const AUTH_SESSION_STORAGE_KEY = 'pulsefield.auth.session.v1'
+function createBleSession(current: Store, endedAt: number, state: Session['state']): Session {
+  // Keep a display-friendly 100 Hz envelope trace for history, while retaining
+  // exact received counts separately for an honest sample count.
+  const waveformSamples = current.bleWaveformHistorySamples
+  const microphoneHistory = waveformSamples.length ? current.bleMicSamples.filter(sample => sample.eventDetected).slice(-128) : current.bleMicSamples.slice(-1200)
+  return { id: current.activeBleSessionId!, startedAt: current.startedAt!, endedAt, state, source: 'ble',
+    samples: microphoneHistory, waveformSamples, pressureSamples: current.blePressureSamples.slice(-600),
+    waveformSampleCount: current.bleWaveformSampleCount, ...(current.bleBloodPressure ? { bloodPressureEstimate: current.bleBloodPressure } : {}) }
+}
+function loadAuthSession(): { token: string; expiresAt: string } | undefined {
+  try { const value = JSON.parse(sessionStorage.getItem(AUTH_SESSION_STORAGE_KEY) ?? 'null') as { token?: unknown; expiresAt?: unknown } | null
+    if (typeof value?.token === 'string' && typeof value.expiresAt === 'string' && Date.parse(value.expiresAt) > Date.now()) return { token: value.token, expiresAt: value.expiresAt }
+  } catch { /* storage may be unavailable */ }
+  try { sessionStorage.removeItem(AUTH_SESSION_STORAGE_KEY) } catch { /* storage may be unavailable */ }
+  return undefined
+}
+function saveAuthSession(token?: string, expiresAt?: string) {
+  try { if (token && expiresAt) sessionStorage.setItem(AUTH_SESSION_STORAGE_KEY, JSON.stringify({ token, expiresAt })); else sessionStorage.removeItem(AUTH_SESSION_STORAGE_KEY) }
+  catch { /* keep the active session in memory when tab storage is unavailable */ }
+}
+const initialAuth = loadAuthSession()
+if (initialAuth) backendApi.setToken(initialAuth.token)
 
 function loadBleSessions(): Session[] {
   try {
@@ -64,16 +93,24 @@ function toTelemetry(row: RemoteSample): Telemetry {
     ...(row.is_valid && row.cuff_pressure_mmhg != null && row.pressure_calibration_version ? { cuffPressureMmHg: row.cuff_pressure_mmhg } : {}),
     ...(row.processed_signal.filtered != null ? { microphoneFiltered: row.processed_signal.filtered } : {}),
     ...(row.processed_signal.envelope != null ? { acousticEnvelope: row.processed_signal.envelope } : {}),
+    ...(row.processed_signal.threshold != null ? { detectionThreshold: row.processed_signal.threshold } : {}),
+    ...(row.processed_signal.noise_floor != null ? { noiseFloor: row.processed_signal.noise_floor } : {}),
+    ...(row.processed_signal.adc_baseline != null ? { adcBaseline: row.processed_signal.adc_baseline } : {}),
+    ...(row.processed_signal.sample_rate_hz != null ? { sampleRateHz: row.processed_signal.sample_rate_hz } : {}),
+    ...(row.processed_signal.calibration_mode != null ? { calibrationMode: row.processed_signal.calibration_mode as Telemetry['calibrationMode'] } : {}),
+    ...(row.processed_signal.calibrated != null ? { calibrated: row.processed_signal.calibrated } : {}),
     deviceState: 'measuring',
   }
 }
 
 export const useAppStore = create<Store>((set, get) => ({
-  demo: initialDemo, connected: false, bleConnected: false, deviceOnline: false, backendAvailable: false, databaseStatus: 'unknown',
+  demo: initialDemo, connected: false, bleConnected: false, deviceOnline: false, backendAvailable: false, databaseStatus: 'unknown', apiToken: initialAuth?.token,
   state: 'disconnected', samples: [], sessions: loadBleSessions(), remoteSessions: [], acousticEvents: [], devices: [], busy: false,
   sessionSync: initialDemo ? 'not_applicable' : 'uncertain',
-  bleState: undefined, blePressureRaw: undefined, blePressureMmHg: undefined, blePressureSamples: [], bleMicSamples: [], bleFault: undefined, bleError: undefined, bleConnectionState: 'disconnected',
-  setApiToken: token => { const trimmed = token?.trim(); backendApi.setToken(trimmed); set({ apiToken: trimmed || undefined, error: undefined }) },
+  bleState: undefined, blePressureRaw: undefined, blePressureMmHg: undefined, blePressureSamples: [], bleMicSamples: [], bleFault: undefined, bleError: undefined, bleConnectionStage: undefined, bleConnectionState: 'disconnected',
+  bleWaveformSamples: [], bleWaveformHistorySamples: [], bleWaveformSampleCount: 0, bleWaveformDroppedSamples: 0, bleWaveformSupported: false,
+  wifiNetworks: [], wifiStatus: undefined,
+  setApiToken: (token, expiresAt) => { const trimmed = token?.trim(); backendApi.setToken(trimmed); saveAuthSession(trimmed, expiresAt); set({ apiToken: trimmed || undefined, error: undefined }) },
   refreshBackend: async () => {
     try {
       await backendApi.health()
@@ -100,18 +137,25 @@ export const useAppStore = create<Store>((set, get) => ({
     }
   },
   connectPhone: async () => {
-    set({ bleError: undefined, busy: true, bleConnectionState: 'connecting' })
+    set({ bleError: undefined, bleWaveformSupported: false, busy: true, bleConnectionState: 'connecting' })
     try {
       await phoneBle.connect((event: PhoneBleEvent) => {
-        if (event.kind === 'connected') set({ bleConnected: true, bleConnectionState: 'connected', bleError: undefined })
+        if (event.kind === 'connectionProgress') set({ bleConnectionStage: String(event.value.message ?? 'Connecting to controller…') })
+        else if (event.kind === 'transportConnected') set({ bleConnected: true })
+        else if (event.kind === 'connected') set({ bleConnected: true, bleConnectionState: 'connected', bleConnectionStage: undefined, bleError: undefined })
+        else if (event.kind === 'waveformAvailable') set({ bleWaveformSupported: true })
+        else if (event.kind === 'waveformUnavailable') set({ bleWaveformSupported: false })
         else if (event.kind === 'reconnecting') set({ bleConnected: false, bleConnectionState: 'reconnecting' })
-        else if (event.kind === 'disconnected') set({ bleConnected: false, bleConnectionState: 'disconnected' })
+        else if (event.kind === 'disconnected') set({ bleConnected: false, bleConnectionState: 'disconnected', bleConnectionStage: undefined })
         else if (event.kind === 'state') {
           const state = String(event.value.state ?? 'unknown')
           const fault = String(event.value.fault ?? 'none')
           const active = ['measuring', 'inflating', 'deflating'].includes(state)
           const wasActive = ['starting', 'measuring', 'stopping'].includes(get().state)
-          set({ bleState: state, bleFault: fault,
+          const systolicMmHg = event.value.sys_mmhg, diastolicMmHg = event.value.dia_mmhg
+          const bpValuesAvailable = event.value.bp_valid === true || event.value.bp_demo === true
+          const bleBloodPressure = bpValuesAvailable && typeof systolicMmHg === 'number' && Number.isFinite(systolicMmHg) && typeof diastolicMmHg === 'number' && Number.isFinite(diastolicMmHg) && systolicMmHg > diastolicMmHg ? { systolicMmHg, diastolicMmHg } : undefined
+          set({ bleState: state, bleFault: fault, bleBloodPressure,
             ...(state === 'measuring' || state === 'inflating' ? { state: 'measuring' as SessionState } : {}),
             ...(state === 'deflating' ? { state: (get().state === 'stopping' ? 'stopping' : 'measuring') as SessionState } : {}),
             ...(state === 'fault' || state === 'emergency_stop' ? { state: 'device_fault' as SessionState } : {}),
@@ -120,23 +164,28 @@ export const useAppStore = create<Store>((set, get) => ({
             ...(state === 'idle' && (get().state === 'disconnected' || (get().state === 'device_fault' && fault === 'none')) ? { state: 'connected_idle' as SessionState, startedAt: undefined, endedAt: undefined, activeBleSessionId: undefined } : {}) })
           if (state === 'completed' && wasActive && get().activeBleSessionId && get().startedAt) {
             const endedAt = Date.now(); const current = get()
-            const session: Session = { id: current.activeBleSessionId!, startedAt: current.startedAt!, endedAt, state: 'completed', source: 'ble', samples: current.bleMicSamples.slice(-1200) }
+            const session = createBleSession(current, endedAt, 'completed')
             set({ endedAt, sessions: persistBleSession(session, current.sessions), activeBleSessionId: undefined })
           }
           if (state === 'fault' && wasActive && get().activeBleSessionId && get().startedAt) {
             const endedAt = Date.now(); const current = get()
-            const session: Session = { id: current.activeBleSessionId!, startedAt: current.startedAt!, endedAt, state: 'incomplete', source: 'ble', samples: current.bleMicSamples.slice(-1200) }
+            const session = createBleSession(current, endedAt, 'incomplete')
             set({ endedAt, sessions: persistBleSession(session, current.sessions), activeBleSessionId: undefined })
           }
+          if (state === 'idle' && !wasActive) lastWaveformSequence = undefined
         } else if (event.kind === 'pressure') {
           const raw = typeof event.value.raw_counts === 'number' ? event.value.raw_counts : undefined
           const mmhg = typeof event.value.mmhg === 'number' ? event.value.mmhg : undefined
-          const valid = event.value.valid === true && event.value.pressure_calibrated === true && mmhg !== undefined && Number.isFinite(mmhg) && mmhg >= 0 && mmhg <= 400
+          const calibrated = event.value.pressure_calibrated === true
+          const valid = event.value.valid === true && calibrated && mmhg !== undefined && Number.isFinite(mmhg) && mmhg >= 0 && mmhg <= 400
+          const deviceTimestampMs = typeof event.value.uptime_ms === 'number' ? event.value.uptime_ms : undefined
           set(s => ({ blePressureRaw: raw, blePressureMmHg: valid ? mmhg : undefined,
-            blePressureSamples: valid && ['measuring', 'stopping'].includes(s.state)
-              ? [...s.blePressureSamples.slice(-599), { receivedAt: Date.now(), cuffPressureMmHg: mmhg!, deviceState: 'measuring' }]
+            blePressureSamples: raw !== undefined && ['measuring', 'stopping'].includes(s.state)
+              ? [...s.blePressureSamples.slice(-1199), { receivedAt: Date.now(), ...(deviceTimestampMs !== undefined ? { deviceTimestampMs } : {}), rawPressureCounts: raw, ...(valid ? { cuffPressureMmHg: mmhg! } : {}), deviceState: 'measuring' }]
               : s.blePressureSamples }))
         } else if (event.kind === 'korotkoff') {
+          const active = get()
+          if (!active.activeBleSessionId || active.endedAt !== undefined || !['starting', 'measuring', 'stopping'].includes(active.state)) return
           const timestamp = event.value.device_timestamp_ms
           const envelope = event.value.envelope
           const raw = event.value.raw_adc
@@ -144,25 +193,75 @@ export const useAppStore = create<Store>((set, get) => ({
           const filtered = event.value.filtered
           if (typeof timestamp === 'number' && typeof envelope === 'number' && Number.isFinite(envelope) && typeof filtered === 'number' && Number.isFinite(filtered) && typeof raw === 'number') {
             const pressureValid = event.value.pressure_valid === true && typeof mmhg === 'number' && Number.isFinite(mmhg) && mmhg >= 0 && mmhg <= 400
-            const sample: Telemetry = { receivedAt: Date.now(), deviceTimestampMs: timestamp, microphoneFiltered: filtered, acousticEnvelope: envelope, eventDetected: event.value.event_detected === true,
+            const clipped = event.value.adc_clipped === true
+            const sample: Telemetry = { receivedAt: Date.now(), deviceTimestampMs: timestamp, microphoneFiltered: filtered, acousticEnvelope: envelope,
+              ...(typeof event.value.threshold==='number'?{detectionThreshold:event.value.threshold}:{}), ...(typeof event.value.noise_floor==='number'?{noiseFloor:event.value.noise_floor}:{}),
+              ...(typeof event.value.adc_baseline==='number'?{adcBaseline:event.value.adc_baseline}:{}), ...(typeof event.value.sample_rate_hz==='number'?{sampleRateHz:event.value.sample_rate_hz}:{}),
+              ...(typeof event.value.calibration_mode==='string'?{calibrationMode:event.value.calibration_mode as Telemetry['calibrationMode']}:{}), ...(typeof event.value.calibrated==='boolean'?{calibrated:event.value.calibrated}:{}),
+              ...(typeof event.value.event_duration_ms==='number'?{eventDurationMs:event.value.event_duration_ms}:{}), ...(typeof event.value.event_strength==='number'?{eventStrength:event.value.event_strength}:{}),
+              eventDetected: event.value.event_detected === true, ...(clipped ? { valid: false, qualityFlags: ['microphone_adc_clipped'] } : {}),
               ...(pressureValid ? { cuffPressureMmHg: mmhg as number } : {}), deviceState: 'measuring' }
             set(s => ({ bleMicSamples: [...s.bleMicSamples.slice(-1199), sample] }))
+          }
+        } else if (event.kind === 'waveform') {
+          const active = get()
+          if (!active.activeBleSessionId || active.endedAt !== undefined || !['starting', 'measuring', 'stopping'].includes(active.state)) return
+          const firstSequence = event.value.firstSequence
+          const firstTimestampUs = event.value.firstTimestampUs
+          const values = event.value.samples
+          const parsed = Array.isArray(values) ? values.map(value => typeof value === 'number' ? { filtered: value } : value as Record<string, unknown>) : []
+          if (typeof firstSequence === 'number' && typeof firstTimestampUs === 'number' && Number.isFinite(firstTimestampUs) && parsed.length > 0 && parsed.length <= 80 && parsed.every(value => typeof value.filtered === 'number' && Number.isFinite(value.filtered) && (value.envelope === undefined || typeof value.envelope === 'number' && Number.isFinite(value.envelope)) && (value.threshold === undefined || typeof value.threshold === 'number' && Number.isFinite(value.threshold)))) {
+            let gap = 0
+            if (lastWaveformSequence !== undefined) {
+              const distance = (firstSequence - ((lastWaveformSequence + 1) >>> 0)) >>> 0
+              if (distance < 0x80000000) gap = distance
+            }
+            lastWaveformSequence = (firstSequence + parsed.length - 1) >>> 0
+            const receivedAt = Date.now()
+            const diagnostic = active.bleMicSamples.at(-1)
+            let env = active.bleWaveformSamples.at(-1)?.acousticEnvelope ?? 0
+            const envelopeAlpha = 1 - Math.exp(-1 / (2000 * 0.008))
+            const batch = parsed.map((item, index): Telemetry => { const microphoneFiltered=item.filtered as number;const detectionThreshold=typeof item.threshold==='number'?item.threshold:diagnostic?.detectionThreshold;env += envelopeAlpha * (Math.abs(microphoneFiltered) - env);return { receivedAt, deviceTimestampMs: firstTimestampUs / 1000 + index * 0.5, sequence: (firstSequence + index) >>> 0, microphoneFiltered, acousticEnvelope: typeof item.envelope==='number'?item.envelope:env, ...(detectionThreshold !== undefined ? { detectionThreshold } : {}), ...(diagnostic?.noiseFloor !== undefined ? { noiseFloor: diagnostic.noiseFloor } : {}), ...(diagnostic?.adcBaseline !== undefined ? { adcBaseline: diagnostic.adcBaseline } : {}), sampleRateHz: 2000, deviceState: 'measuring' } })
+            const historyBatch = batch.filter((_, index) => ((firstSequence + index) % 40) === 0)
+            set(s => ({ bleWaveformSamples: [...s.bleWaveformSamples, ...batch].slice(-MAX_BLE_WAVEFORM_SAMPLES), bleWaveformHistorySamples: [...s.bleWaveformHistorySamples, ...historyBatch].slice(-4000), bleWaveformSampleCount: s.bleWaveformSampleCount + batch.length, bleWaveformDroppedSamples: s.bleWaveformDroppedSamples + gap }))
           }
         }
         else if (event.kind === 'fault') set({ bleFault: String(event.value.code ?? 'unknown') })
         else if (event.kind === 'error') set({ bleError: String(event.value.message ?? 'Device connection failed.') })
+        else if (event.kind === 'wifiNotificationUnavailable') set({ wifiStatus: String(event.value.message ?? 'Pair with the controller before configuring Wi-Fi.') })
+        else if (event.kind === 'wifi') {
+          const type = String(event.value.type ?? '')
+          if (type === 'network' && typeof event.value.ssid === 'string') {
+            const network = { ssid: event.value.ssid, rssi: Number(event.value.rssi ?? -100), secure: event.value.secure === true }
+            set(s => ({ wifiNetworks: [...s.wifiNetworks.filter(item => item.ssid !== network.ssid), network].sort((a, b) => b.rssi - a.rssi) }))
+          } else if (type === 'scan_started') set({ wifiNetworks: [], wifiStatus: 'Scanning for nearby Wi-Fi networks…' })
+          else if (type === 'scan_complete') set({ wifiStatus: `Found ${Number(event.value.count ?? 0)} Wi-Fi network(s).` })
+          else if (type === 'status') set({ wifiStatus: String(event.value.message ?? event.value.state ?? 'Wi-Fi status updated.') })
+        }
       })
       set({ bleConnected: true, bleConnectionState: 'connected' })
     } catch (error) {
       phoneBle.disconnect()
-      set({ bleConnected: false, bleConnectionState: 'disconnected', bleError: errorMessage(error, 'Device connection failed.') })
-      throw error
+      const cancelled = error instanceof Error && error.name === 'AbortError'
+      set({ bleConnected: false, bleConnectionState: 'disconnected', bleConnectionStage: undefined, bleError: cancelled ? undefined : errorMessage(error, 'Device connection failed.') })
+      if (!cancelled) throw error
     } finally { set({ busy: false }) }
   },
-  disconnectPhone: () => { phoneBle.disconnect(); set({ bleConnected: false, bleConnectionState: 'disconnected' }) },
+  cancelPhoneConnect: () => { phoneBle.cancelConnect(); set({ busy: false, bleConnected: false, bleConnectionState: 'disconnected', bleConnectionStage: undefined }) },
+  disconnectPhone: () => { phoneBle.disconnect(); set({ bleConnected: false, bleConnectionState: 'disconnected', bleConnectionStage: undefined }) },
   sendPhoneCommand: async command => {
     try { await phoneBle.send(command); set({ bleError: undefined }) }
     catch (error) { set({ bleError: errorMessage(error, 'Device command failed.') }); throw error }
+  },
+  scanWifiNetworks: async () => {
+    set({ wifiNetworks: [], wifiStatus: 'Scanning for nearby Wi-Fi networks…' })
+    try { await phoneBle.wifiCommand('SCAN_WIFI') }
+    catch (error) { const message = error instanceof Error && error.message === 'scan_failed' ? 'The controller could not start a Wi-Fi scan after retrying. Check that it is idle, then try again.' : errorMessage(error, 'Wi-Fi scan failed.'); set({ wifiStatus: message }); throw new Error(message) }
+  },
+  configureWifi: async (ssid, password) => {
+    set({ wifiStatus: `Sending Wi-Fi settings for ${ssid}…` })
+    try { await phoneBle.wifiCommand('SET_WIFI', { ssid, password }); set({ wifiStatus: `Wi-Fi settings saved for ${ssid}. The controller is connecting…` }) }
+    catch (error) { set({ wifiStatus: errorMessage(error, 'Could not save Wi-Fi settings.') }); throw error }
   },
   resetDeviceFault: async () => {
     if (!get().bleConnected) throw new Error('Connect to the controller over BLE before resetting its fault.')
@@ -225,7 +324,8 @@ export const useAppStore = create<Store>((set, get) => ({
       catch (e) { set({ busy: false, connected: false, state: 'error', error: errorMessage(e, 'Could not connect to the demo device.') }); return false }
     }
     if (current.bleConnected && (!current.apiToken || !current.backendAvailable || !current.deviceOnline)) {
-      set({ busy: true, error: undefined, startedAt: undefined, endedAt: undefined, blePressureSamples: [], bleMicSamples: [], activeBleSessionId: crypto.randomUUID() })
+      lastWaveformSequence = undefined
+      set({ busy: true, error: undefined, startedAt: undefined, endedAt: undefined, bleBloodPressure: undefined, blePressureSamples: [], bleMicSamples: [], bleWaveformSamples: [], bleWaveformHistorySamples: [], bleWaveformSampleCount: 0, bleWaveformDroppedSamples: 0, activeBleSessionId: crypto.randomUUID() })
       try { await get().sendPhoneCommand('START_MEASUREMENT'); if (get().bleState !== 'fault' && get().bleState !== 'emergency_stop') set({ state: 'measuring', startedAt: get().startedAt ?? Date.now(), endedAt: undefined }); return get().bleState === 'measuring' || get().state === 'measuring' }
       catch (e) { set({ state: get().bleState === 'fault' ? 'device_fault' : 'error', activeBleSessionId: undefined, error: errorMessage(e, 'The device rejected Start over BLE.') }); return false }
       finally { set({ busy: false }) }
@@ -275,6 +375,10 @@ export const useAppStore = create<Store>((set, get) => ({
         error: uncertain ? `${errorMessage(e, 'Start could not be confirmed.')} Start may have reached the backend; retry uses the same idempotency key, and device state must be checked.` : errorMessage(e, 'Start could not be confirmed. No demo fallback was used.') })
       return false
     }
+    if (current.bleConnected) {
+      lastWaveformSequence = undefined
+      set({ bleWaveformSamples: [], bleWaveformHistorySamples: [], bleWaveformSampleCount: 0, bleWaveformDroppedSamples: 0, bleMicSamples: [], blePressureSamples: [] })
+    }
   },
   start: async () => {
     if (get().demo) {
@@ -322,10 +426,10 @@ export const useAppStore = create<Store>((set, get) => ({
       set({ state: 'uncertain', busy: false, sessionSync: 'uncertain', error: 'Stop was requested but completion was not confirmed. The device may still be running.' })
     } catch (e) { set({ state: 'uncertain', busy: false, sessionSync: 'uncertain', error: `${errorMessage(e, 'Stop request failed.')} Device stop is not confirmed.` }) }
   },
-  resetSession: () => { const s = get(); if (s.busy || (s.state !== 'completed' && s.state !== 'cancelled')) return; remoteAbort?.abort(); liveSessionId = undefined; set({ state: s.connected || s.bleConnected ? 'connected_idle' : 'disconnected', samples: [], acousticEvents: [], bleMicSamples: [], blePressureSamples: [], blePressureMmHg: undefined, startedAt: undefined, endedAt: undefined, activeBleSessionId: undefined, remoteSession: undefined, error: undefined }) },
+  resetSession: () => { const s = get(); if (s.busy || (s.state !== 'completed' && s.state !== 'cancelled')) return; remoteAbort?.abort(); liveSessionId = undefined; lastWaveformSequence = undefined; set({ state: s.connected || s.bleConnected ? 'connected_idle' : 'disconnected', samples: [], acousticEvents: [], bleMicSamples: [], bleWaveformSamples: [], bleWaveformHistorySamples: [], bleWaveformSampleCount: 0, bleWaveformDroppedSamples: 0, blePressureSamples: [], blePressureMmHg: undefined, bleBloodPressure: undefined, startedAt: undefined, endedAt: undefined, activeBleSessionId: undefined, remoteSession: undefined, error: undefined }) },
   addSample: sample => set(s => ({ samples: [...s.samples.slice(-(MAX_BUFFERED_SAMPLES - 1)), sample] })),
   clearError: () => set({ error: undefined }),
-  setDemo: value => { const state = get().state; if (!get().busy && state !== 'measuring' && state !== 'stopping' && state !== 'starting') { remoteAbort?.abort(); set({ demo: value, connected: false, bleConnected: false, deviceOnline: false, state: 'disconnected', error: undefined, samples: [], acousticEvents: [], blePressureMmHg: undefined, blePressureSamples: [], startedAt: undefined, endedAt: undefined, remoteSession: undefined, sessionSync: value ? 'not_applicable' : 'uncertain' }); void demoDevice.disconnect() } },
+  setDemo: value => { const state = get().state; if (!get().busy && state !== 'measuring' && state !== 'stopping' && state !== 'starting') { remoteAbort?.abort(); lastWaveformSequence = undefined; set({ demo: value, connected: false, bleConnected: false, deviceOnline: false, state: 'disconnected', error: undefined, samples: [], acousticEvents: [], blePressureMmHg: undefined, blePressureSamples: [], bleMicSamples: [], bleWaveformSamples: [], bleWaveformSampleCount: 0, bleWaveformDroppedSamples: 0, startedAt: undefined, endedAt: undefined, remoteSession: undefined, sessionSync: value ? 'not_applicable' : 'uncertain' }); void demoDevice.disconnect() } },
   simulateDisconnect: () => { if (!get().demo || !get().connected) return; const wasMeasuring = get().state === 'measuring'; demoDevice.simulateLinkLoss(); set({ connected: false, bleConnected: false, state: wasMeasuring ? 'uncertain' : 'disconnected', error: wasMeasuring ? 'Connection lost. The device stop state is not confirmed.' : undefined }) },
   simulateFault: () => { if (!get().demo || !get().connected || get().busy) return; demoDevice.simulateFault(); set({ state: 'device_fault', error: 'The demo device reported a simulated fault.' }) },
 }))

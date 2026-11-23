@@ -67,8 +67,8 @@ class FakeTransport:
         self.connected = False
         self.on_disconnect(self, None, None, 1, None)
 
-    def send(self, topic: str, payload: bytes, mid: int = 1, qos: int = 1):
-        message = SimpleNamespace(topic=topic, payload=payload, mid=mid, qos=qos)
+    def send(self, topic: str, payload: bytes, mid: int = 1, qos: int = 1, retain: bool = False):
+        message = SimpleNamespace(topic=topic, payload=payload, mid=mid, qos=qos, retain=retain)
         self.on_message(self, None, message)
 
 
@@ -123,9 +123,9 @@ def test_connect_subscribes_only_to_device_ingress_topics(db_session: Session) -
 
     assert service.health["state"] == "connected"
     assert transport.subscriptions == [
-        ("bp/v1/devices/+/telemetry", 1),
-        ("bp/v1/devices/+/status", 1),
-        ("bp/v1/devices/+/responses", 1),
+        ("bp/devices/+/telemetry", 1),
+        ("bp/devices/+/status", 1),
+        ("bp/devices/+/ack", 1),
     ]
     assert not any(topic.endswith("/commands") for topic, _qos in transport.subscriptions)
 
@@ -142,13 +142,46 @@ def test_status_message_requires_matching_enrolled_device_identity(db_session: S
         "state": "idle",
     }
 
-    transport.send(f"bp/v1/devices/{device.id}/status", json.dumps(payload).encode(), mid=5)
+    transport.send(f"bp/devices/{device.id}/status", json.dumps(payload).encode(), mid=5)
     service.process_one()
 
     assert service.health["rejected_count"] == 1
     assert transport.acks == [(5, 1)]
     db_session.expire_all()
     assert db_session.get(Device, device.id).reported_state == "idle"
+
+
+def test_configured_emqx_device_principal_maps_to_registered_internal_uuid(db_session: Session) -> None:
+    device, _session = registered_device(db_session)
+    device.mqtt_principal = "bp_device_001"
+    db_session.commit()
+    service, transport = make_service(db_session)
+    transport.connect_callback()
+    payload = {"schema_version": "1", "message_id": str(uuid4()), "device_id": str(device.id),
+               "sequence": 1, "state": "idle", "device_uptime_ms": 1000}
+
+    transport.send("bp/devices/bp_device_001/status", json.dumps(payload).encode(), mid=501)
+    service.process_one()
+
+    db_session.expire_all()
+    assert service.health["rejected_count"] == 0
+    assert db_session.get(Device, device.id).reported_state == "idle"
+
+
+def test_retained_status_is_rejected_and_does_not_refresh_online_timestamp(db_session: Session) -> None:
+    device, _session = registered_device(db_session)
+    previous_seen = device.state_reported_at
+    service, transport = make_service(db_session)
+    transport.connect_callback()
+    payload = {"schema_version": "1", "message_id": str(uuid4()), "device_id": str(device.id),
+               "sequence": 2, "state": "idle", "device_uptime_ms": 2000}
+
+    transport.send(f"bp/devices/{device.id}/status", json.dumps(payload).encode(), mid=502, retain=True)
+    service.process_one()
+
+    db_session.expire_all()
+    assert service.health["rejected_count"] == 1
+    assert db_session.get(Device, device.id).state_reported_at == previous_seen
 
 
 def test_display_start_request_creates_one_owner_scoped_session_and_start_command(db_session: Session) -> None:
@@ -166,7 +199,7 @@ def test_display_start_request_creates_one_owner_scoped_session_and_start_comman
     payload = {"schema_version": "1", "message_id": str(uuid4()), "device_id": str(device.id),
                "sequence": 1, "state": "idle", "start_request_id": str(request_id)}
 
-    transport.send(f"bp/v1/devices/{device.id}/status", json.dumps(payload).encode(), mid=51)
+    transport.send(f"bp/devices/{device.id}/status", json.dumps(payload).encode(), mid=51)
     service.process_one()
     db_session.expire_all()
     session = db_session.scalar(select(MeasurementSession).where(MeasurementSession.client_request_id == request_id))
@@ -183,7 +216,7 @@ def test_display_start_request_creates_one_owner_scoped_session_and_start_comman
 
     payload["message_id"] = str(uuid4())
     payload["sequence"] = 2
-    transport.send(f"bp/v1/devices/{device.id}/status", json.dumps(payload).encode(), mid=52)
+    transport.send(f"bp/devices/{device.id}/status", json.dumps(payload).encode(), mid=52)
     service.process_one()
     assert db_session.scalar(select(MeasurementSession.id).where(MeasurementSession.client_request_id == request_id)) == session.id
     assert len(transport.publishes) == 1
@@ -196,7 +229,7 @@ def test_telemetry_topic_and_payload_device_must_match(db_session: Session) -> N
     payload = make_payload(uuid4(), session.id)
     envelope = {"schema_version": "1", "payload": payload.model_dump(mode="json")}
 
-    transport.send(f"bp/v1/devices/{device.id}/telemetry", json.dumps(envelope).encode(), mid=6)
+    transport.send(f"bp/devices/{device.id}/telemetry", json.dumps(envelope).encode(), mid=6)
     service.process_one()
 
     assert service.health["rejected_count"] == 1
@@ -210,7 +243,7 @@ def test_valid_telemetry_is_persisted_only_after_topic_identity_validation(db_se
     payload = make_payload(device.id, session.id, pressure=None)
     envelope = {"schema_version": "1", "payload": payload.model_dump(mode="json")}
 
-    transport.send(f"bp/v1/devices/{device.id}/telemetry", json.dumps(envelope).encode(), mid=7)
+    transport.send(f"bp/devices/{device.id}/telemetry", json.dumps(envelope).encode(), mid=7)
     service.process_one()
 
     db_session.expire_all()
@@ -224,7 +257,7 @@ def test_pressure_telemetry_requires_confirmed_device_calibration(db_session: Se
     transport.connect_callback()
     payload = make_payload(device.id, session.id, pressure=120)
     envelope = {"schema_version": "1", "payload": payload.model_dump(mode="json")}
-    transport.send(f"bp/v1/devices/{device.id}/telemetry", json.dumps(envelope).encode(), mid=70)
+    transport.send(f"bp/devices/{device.id}/telemetry", json.dumps(envelope).encode(), mid=70)
     service.process_one()
     assert db_session.scalar(select(TelemetrySample)) is None
     assert service.health["rejected_count"] == 1
@@ -237,7 +270,7 @@ def test_sequence_gaps_out_of_order_and_clock_skew_are_visible(db_session: Sessi
 
     first = make_payload(device.id, session.id, pressure=None, sample_sequence=10)
     transport.send(
-        f"bp/v1/devices/{device.id}/telemetry",
+        f"bp/devices/{device.id}/telemetry",
         json.dumps({"schema_version": "1", "payload": first.model_dump(mode="json")}).encode(), mid=71,
     )
     service.process_one()
@@ -245,13 +278,13 @@ def test_sequence_gaps_out_of_order_and_clock_skew_are_visible(db_session: Sessi
     gap = make_payload(device.id, session.id, pressure=None, sample_sequence=12)
     gap.samples[0].device_recorded_at = datetime.now(timezone.utc) + timedelta(hours=1)
     transport.send(
-        f"bp/v1/devices/{device.id}/telemetry",
+        f"bp/devices/{device.id}/telemetry",
         json.dumps({"schema_version": "1", "payload": gap.model_dump(mode="json")}).encode(), mid=72,
     )
     service.process_one()
     late = make_payload(device.id, session.id, pressure=None, sample_sequence=11)
     transport.send(
-        f"bp/v1/devices/{device.id}/telemetry",
+        f"bp/devices/{device.id}/telemetry",
         json.dumps({"schema_version": "1", "payload": late.model_dump(mode="json")}).encode(), mid=73,
     )
     service.process_one()
@@ -283,7 +316,7 @@ def test_late_start_ack_marks_session_interrupted_and_never_completed(db_session
         "schema_version": "1", "response_id": str(uuid4()), "command_id": str(command.command_id),
         "device_id": str(device.id), "status": "completed", "device_state": "measuring",
     }
-    transport.send(f"bp/v1/devices/{device.id}/responses", json.dumps(response).encode(), mid=74)
+    transport.send(f"bp/devices/{device.id}/ack", json.dumps(response).encode(), mid=74)
     service.process_one()
     db_session.expire_all()
     assert db_session.get(MeasurementSession, session.id).lifecycle == "interrupted"
@@ -303,7 +336,7 @@ def test_fresh_session_scoped_status_confirms_state_but_old_status_cannot_regres
         state=DeviceReportedState.MEASURING, session_id=session.id,
     )
     transport.send(
-        f"bp/v1/devices/{device.id}/status", measuring.model_dump_json().encode(), mid=75
+        f"bp/devices/{device.id}/status", measuring.model_dump_json().encode(), mid=75
     )
     service.process_one()
     db_session.expire_all()
@@ -316,13 +349,13 @@ def test_fresh_session_scoped_status_confirms_state_but_old_status_cannot_regres
         schema_version="1", message_id=uuid4(), device_id=device.id, sequence=11,
         state=DeviceReportedState.STOPPED, session_id=session.id,
     )
-    transport.send(f"bp/v1/devices/{device.id}/status", stopped.model_dump_json().encode(), mid=76)
+    transport.send(f"bp/devices/{device.id}/status", stopped.model_dump_json().encode(), mid=76)
     service.process_one()
     old = DeviceStatusMessage(
         schema_version="1", message_id=uuid4(), device_id=device.id, sequence=9,
         state=DeviceReportedState.MEASURING, session_id=session.id,
     )
-    transport.send(f"bp/v1/devices/{device.id}/status", old.model_dump_json().encode(), mid=77)
+    transport.send(f"bp/devices/{device.id}/status", old.model_dump_json().encode(), mid=77)
     service.process_one()
 
     db_session.expire_all()
@@ -360,11 +393,11 @@ def test_command_acknowledgements_are_correlated_before_session_completion(db_se
         "schema_version": "1", "response_id": str(uuid4()), "command_id": str(start_command.command_id),
         "device_id": str(device.id), "status": "accepted", "device_state": "idle",
     }
-    transport.send(f"bp/v1/devices/{device.id}/responses", json.dumps(accepted).encode(), mid=8)
+    transport.send(f"bp/devices/{device.id}/ack", json.dumps(accepted).encode(), mid=8)
     service.process_one()
 
     completed_start = {**accepted, "response_id": str(uuid4()), "status": "completed", "device_state": "measuring"}
-    transport.send(f"bp/v1/devices/{device.id}/responses", json.dumps(completed_start).encode(), mid=9)
+    transport.send(f"bp/devices/{device.id}/ack", json.dumps(completed_start).encode(), mid=9)
     service.process_one()
     db_session.expire_all()
     assert db_session.get(MeasurementSession, session.id).lifecycle == "measuring"
@@ -375,10 +408,10 @@ def test_command_acknowledgements_are_correlated_before_session_completion(db_se
         "schema_version": "1", "response_id": str(uuid4()), "command_id": str(stop_command.command_id),
         "device_id": str(device.id), "status": "accepted", "device_state": "measuring",
     }
-    transport.send(f"bp/v1/devices/{device.id}/responses", json.dumps(accepted_stop).encode(), mid=10)
+    transport.send(f"bp/devices/{device.id}/ack", json.dumps(accepted_stop).encode(), mid=10)
     service.process_one()
     completed_stop = {**accepted_stop, "response_id": str(uuid4()), "status": "completed", "device_state": "stopped"}
-    transport.send(f"bp/v1/devices/{device.id}/responses", json.dumps(completed_stop).encode(), mid=11)
+    transport.send(f"bp/devices/{device.id}/ack", json.dumps(completed_stop).encode(), mid=11)
     service.process_one()
 
     db_session.expire_all()
@@ -418,7 +451,7 @@ def test_authorized_command_is_correlated_expiring_and_nonretained(db_session: S
     assert result.status == "sent"
     assert len(transport.publishes) == 1
     topic, body, expiry, _timeout = transport.publishes[0]
-    assert topic == f"bp/v1/devices/{device.id}/commands"
+    assert topic == f"bp/devices/{device.id}/commands"
     assert expiry <= 15
     envelope = json.loads(body)
     assert envelope["command_id"] == str(command.command_id)

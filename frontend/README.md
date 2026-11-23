@@ -18,9 +18,10 @@ npm run dev
 
 ## Backend/API integration
 
-The client validates health/readiness, owner-scoped device registration/status, sessions/history, sample/event pages, reports, and PDF downloads. Owner access uses the backend-issued bearer token entered on Settings; it is kept in memory for the current page session only. Refreshing the page clears it. Backend CORS must allow the exact frontend origin, normally `http://localhost:5173`.
+The client validates health/readiness, owner-scoped device registration/status, sessions/history, sample/event pages, reports, and PDF downloads. Accounts can register and sign in from the User page. The backend-issued bearer token is kept in tab `sessionStorage`, rotated before expiry, and revoked at sign-out; manually supplied legacy owner tokens remain memory-only. Backend CORS must allow the exact frontend origin, normally `http://localhost:5173`.
 
 - Registering a device creates only an owner-scoped database record. It does not enroll MQTT credentials, provision the hardware, or make the device online.
+- BLE can start a measurement directly from the app without an account; completed sessions remain local in this browser. Automatic migration of those guest sessions into an account is not implemented.
 - The session Start button requires a selected device with fresh `online` and `idle` status. It uses an idempotency key and waits for the backend session to reach device-confirmed `measuring` before showing the active state.
 - Stop displays a stopping state and waits for device-confirmed completion. Lost or late confirmation is shown as uncertain; a successful HTTP response alone is never treated as hardware stop.
 - Live updates use the authenticated session SSE endpoint. Batch events cause bounded sample-page retrieval; graph buffers are capped at 120 records and rendering follows incoming batches. Missing values stay unavailable. Telemetry is marked stale after 15 seconds without a server-received sample; this is a frontend freshness indicator, not a device safety threshold.

@@ -4,7 +4,7 @@ An experimental automated blood-pressure monitoring and signal-analysis project 
 
 The repository contains the frontend application, FastAPI backend, PostgreSQL persistence layer, ESP32 signal-processing experiments, and a separate ESP32-based display prototype.
 
-> **Project status:** Experimental prototype under development. The frontend and backend have substantial functionality, while the main ESP32 firmware, pressure acquisition, device communication, and complete end-to-end integration remain works in progress.
+> **Project status:** Experimental prototype under development. The repository now includes integrated ESP32-S3 acquisition, local safety controls, BLE commands, optional MQTT transport, and app-initiated measurement code. The complete physical and cloud workflow remains unverified; BLE guest history migration and clinically validated pressure estimates are not implemented.
 
 > **Disclaimer:** This project is not a certified medical device. It has not undergone clinical validation and must not be used for diagnosis, treatment, or medical decisions.
 
@@ -777,24 +777,11 @@ Never commit real environment files or credentials.
 
 ### MQTT configuration
 
-The backend contains an optional MQTT 5 transport using Paho.
+The backend and `finalESP` firmware use the EMQX endpoint `k7128701.ala.asia-southeast1.emqxsl.com:8883` over verified TLS. Copy root `.env.example` to `.env`, choose a local `POSTGRES_PASSWORD`, and keep MQTT disabled until the backend password is configured. `MQTT_USERNAME` defaults to `bp_backend`; provide the real `MQTT_PASSWORD` locally. The backend image installs system CA certificates. If a separate broker CA is needed, put it under ignored `certs/` and set `MQTT_CA_CERT_PATH=/run/mqtt-ca/<filename>`.
 
-It is disabled by default.
+Register a device in the signed-in app and set firmware `BP_DEVICE_ID` to the returned backend UUID. Set `BP_MQTT_DEVICE_KEY` and the firmware MQTT username to the enrolled broker principal (`bp_device_001` in the supplied setup), and store its password only in ignored `secrets.h`. Enroll that same key against the owned device in the app. MQTT payload `device_id` is the backend UUID; the topic key is the broker principal.
 
-Enabling it requires additional infrastructure and provisioning:
-
-- A reachable MQTT broker.
-- TLS listener and trusted CA certificate.
-- Broker certificate hostname verification.
-- A dedicated backend service identity.
-- Separate device credentials.
-- Per-device topic access-control rules.
-- Device enrollment in the backend database.
-- Firmware implementing the agreed message protocol.
-
-The backend's MQTT implementation does not automatically provision broker credentials or configure an external broker.
-
-Do not enable MQTT in a deployment until the broker, device identity, ACLs, and firmware protocol have been configured and tested.
+EMQX ACLs are configured separately and are not changed by this repository. The current backend needs subscribe access to `bp/devices/+/telemetry`, `bp/devices/+/status`, and `bp/devices/+/ack`, and publish access to `bp/devices/+/commands`. Legacy `bp/v1/devices/...` support is opt-in with `MQTT_LEGACY_TOPIC_COMPATIBILITY=true`; only enable it if the backend principal is authorized for those filters. Each device principal should publish only its own telemetry/status/ack topics and subscribe only to its own commands topic. After setting local secrets and ACLs, rebuild with `docker compose up -d --build backend` and enable `MQTT_ENABLED=true`. Backend commands use QoS 1, expiry, and acknowledgements. Current PubSubClient firmware publishes telemetry/status/ack at QoS 0 and messages are not retained. Device status must be fresh before the app marks it online. Never place MQTT credentials in frontend `VITE_*` variables.
 
 ---
 
@@ -862,24 +849,26 @@ The following table distinguishes existing functionality from work that remains.
 | Docker Compose | Configured |
 | MQTT backend transport | Implemented as optional infrastructure; disabled by default |
 | MQTT broker deployment | Not configured |
-| Main ESP32 acoustic detector | Experimental firmware exists |
-| Main ESP32 pressure acquisition and calibrated conversion | Not integrated |
-| Main ESP32 pneumatic measurement state machine | Not integrated |
-| Main ESP32 MQTT communication | Not implemented in the inspected sketches |
+| Integrated ESP32-S3 microphone/pressure acquisition | Implemented in `ESP Code Main/finalESP`; requires board build and hardware verification |
+| Main ESP32 pressure conversion | Implemented with the experimental configured equation; calibration not validated |
+| Main ESP32 pneumatic measurement state machine | Implemented: 150 mmHg target, 160 mmHg firmware hard cutoff, passive pump-backflow with valve closed, full exhaust at 60 mmHg, release completion at 5 mmHg; hardware behavior unverified |
+| Phone BLE app-initiated Start/Stop | Implemented in firmware and frontend; hardware verification pending |
+| Main ESP32 MQTT communication | Implemented behind local `secrets.h`; broker provisioning and deployment are not configured |
 | Display touchscreen UI | Experimental sketch exists |
 | Display-to-main-controller communication | ESP-NOW test exists; complete integration remains |
-| End-to-end hardware/frontend/backend operation | Not completed |
-| Validated systolic/diastolic estimator | Not implemented |
+| End-to-end hardware/frontend/backend operation | Partial; BLE-local sessions work in code, MQTT cloud path requires enrollment/broker, local guest sessions do not migrate to accounts |
+| Validated systolic/diastolic estimator | Not implemented; detector outputs experimental acoustic candidates only |
 | Clinical validation | Not performed |
 
 ---
 
 ## Known limitations
 
-1. **No complete hardware integration:** The current ESP32 sketches are separate experiments and do not yet form one integrated controller firmware.
-2. **No current device-to-backend telemetry connection:** The inspected main acoustic debugging sketch communicates through USB Serial, not MQTT or Wi-Fi.
-3. **No validated pressure conversion:** Pressure values must not be treated as mmHg without verified sensor calibration and conversion.
-4. **No validated systolic/diastolic estimator:** The backend does not calculate clinically validated systolic or diastolic blood pressure.
+1. **Hardware validation is outstanding:** The integrated controller sketch has not been compiled or exercised on the ESP32-S3 in this environment. Pump, valve, sensor, ADC range, mechanical relief, and passive decay need bench verification.
+2. **Guest migration is not implemented:** BLE guest sessions remain in this browser's local storage and are not uploaded when an account is created or used.
+3. **The BLE and MQTT paths are separate:** BLE measurements are saved locally in the frontend; backend telemetry persistence uses the separately provisioned MQTT device flow. They are not yet unified into a single cloud session.
+4. **Pressure conversion is experimental:** Do not treat pressure values as validated mmHg without recalibration against a reference manometer.
+5. **No validated systolic/diastolic estimator:** The detector records acoustic event candidates; no clinically validated blood-pressure result is produced.
 5. **No clinical validation:** All readings and reports are experimental.
 6. **MQTT requires provisioning:** The backend transport is optional and disabled by default. Broker credentials, device enrollment, TLS and ACL configuration are separate requirements.
 7. **Demo data is not device data:** Demo mode generates simulated signals and does not represent real hardware measurements.

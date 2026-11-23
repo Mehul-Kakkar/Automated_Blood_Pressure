@@ -9,12 +9,13 @@ enum class FaultCode:uint8_t { NONE,PRESSURE_UNCALIBRATED,PINMAP_UNVERIFIED,VALV
 struct DeviceState {
   MeasurementState state=MeasurementState::BOOT;
   FaultCode fault=FaultCode::NONE;
-  uint32_t uptimeMs=0,statusSequence=0,lostSamples=0,sampleSequence=0;
+  uint32_t uptimeMs=0,statusSequence=0,lostSamples=0,sampleSequence=0,pressureUpdatedAtMs=0;
   int32_t pressureRaw=0;
   float pressureMmhg=0.0f;
-  bool pressureAvailable=false,microphoneAvailable=true,timedPumpTest=false;
+  bool pressureAvailable=false,microphoneAvailable=true,timedPumpTest=false,pressureSaturated=false;
   bool pressureMmhgAvailable=false;
   uint32_t timedTestReleaseStartedAtMs=0;
+  uint32_t deflationStartedAtMs=0;
   char sessionId[37]={0};
   char startRequestId[37]={0};
 };

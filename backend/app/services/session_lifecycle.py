@@ -85,7 +85,7 @@ def record_session_event(
     )
 
 
-def make_command(device_id: UUID, session_id: UUID, command_type: DeviceCommandType, ttl_seconds: int):
+def make_command(device_id: UUID, session_id: UUID | None, command_type: DeviceCommandType, ttl_seconds: int):
     from app.messaging.schemas import DeviceCommandRequest
 
     issued = datetime.now(timezone.utc)

@@ -23,7 +23,13 @@ def test_owner_can_register_list_and_read_device_but_registration_is_not_mqtt_en
     assert device["online"] is False
     assert client.get("/api/v1/devices").json()["items"][0]["id"] == device["id"]
     assert client.get(f"/api/v1/devices/{device['id']}").status_code == 200
+    enrolled = client.post(f"/api/v1/devices/{device['id']}/mqtt-enrollment", json={"mqtt_principal": "bp_device_001"})
+    assert enrolled.status_code == 200
+    assert enrolled.json()["mqtt_enrolled"] is True
+    repeated = client.post(f"/api/v1/devices/{device['id']}/mqtt-enrollment", json={"mqtt_principal": "bp_device_001"})
+    assert repeated.status_code == 200
     client.app.dependency_overrides[get_current_owner_username] = lambda: "someone_else"
     assert client.get(f"/api/v1/devices/{device['id']}").status_code == 404
+    assert client.post(f"/api/v1/devices/{device['id']}/mqtt-enrollment", json={"mqtt_principal": "bp_device_001"}).status_code == 404
     duplicate = client.post("/api/v1/devices", json={"device_identifier": "synthetic-device"})
     assert duplicate.status_code == 409

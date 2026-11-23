@@ -91,7 +91,7 @@ def create_session(
     if existing is not None:
         response.status_code = status.HTTP_200_OK
         return _view(db, existing, device, settings)
-    if not device.mqtt_enabled or device.mqtt_principal != str(device.id):
+    if not device.mqtt_enabled or not device.mqtt_principal:
         raise HTTPException(status_code=409, detail="The device is not enrolled for remote messaging.")
     active_session = db.scalar(
         select(MeasurementSession)
@@ -275,7 +275,11 @@ def get_session_samples(
         device_recorded_at=row.device_recorded_at, server_received_at=row.received_at,
         raw_acoustic_sample=RawAcousticSample(adc_counts=row.raw_adc),
         processed_signal=ProcessedSignalSample(filtered=row.filtered, envelope=row.acoustic_envelope,
-            noise_floor=row.noise_floor, threshold=row.threshold),
+            noise_floor=row.noise_floor, threshold=row.threshold,
+            adc_baseline=row.synchronization_metadata.get("adc_baseline"),
+            sample_rate_hz=row.synchronization_metadata.get("sample_rate_hz"),
+            calibration_mode=row.synchronization_metadata.get("calibration_mode"),
+            calibrated=row.synchronization_metadata.get("acoustic_calibrated")),
         event_detected=row.event_detected, cuff_pressure_mmhg=row.pressure_mmhg,
         pressure_calibration_version=row.synchronization_metadata.get("pressure_calibration_version"),
         heart_rate_bpm=row.heart_rate_bpm, is_valid=row.is_valid, quality_flags=row.quality_flags,

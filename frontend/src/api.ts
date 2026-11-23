@@ -8,6 +8,17 @@ const DeviceSchema = z.object({
   state_reported_at: z.string().datetime().nullable().optional(), last_seen_at: z.string().datetime().nullable().optional(),
   pressure_calibration_confirmed: z.boolean(), pressure_calibration_version: z.string().nullable().optional(),
 })
+const DeviceCommandSchema = z.object({
+  command_id: z.string().uuid(), command_type: z.string(), status: z.string(),
+  issued_at: z.string(), expires_at: z.string(), response_code: z.string().nullable().optional(),
+  response_state: z.string().nullable().optional(),
+})
+const MessagingHealthSchema = z.object({
+  state: z.enum(['disabled', 'disconnected', 'connected']), connected: z.boolean(),
+  queue_depth: z.number(), queue_capacity: z.number(), last_connection_at: z.string().nullable(),
+  last_message_at: z.string().nullable(), disconnect_count: z.number(), accepted_count: z.number(),
+  rejected_count: z.number(), oversize_count: z.number(), queue_full_count: z.number(), processing_error_count: z.number(),
+})
 const SessionSchema = z.object({
   id: z.string().uuid(), device_id: z.string().uuid(), lifecycle: z.string(), created_at: z.string(), updated_at: z.string(),
   started_at: z.string().nullable().optional(), ended_at: z.string().nullable().optional(), termination_reason: z.string().nullable().optional(),
@@ -19,7 +30,7 @@ const SessionPageSchema = z.object({ items: z.array(SessionSchema), limit: z.num
 const SamplesSchema = z.object({
   samples: z.array(z.object({ sample_id: z.string(), sequence: z.number().nullable(), device_timestamp_ms: z.number().nullable(),
     device_recorded_at: z.string().nullable(), server_received_at: z.string(), raw_acoustic_sample: z.object({ adc_counts: z.number().nullable() }),
-    processed_signal: z.object({ filtered: z.number().nullable(), envelope: z.number().nullable(), noise_floor: z.number().nullable(), threshold: z.number().nullable() }),
+    processed_signal: z.object({ filtered: z.number().nullable(), envelope: z.number().nullable(), noise_floor: z.number().nullable(), threshold: z.number().nullable(), adc_baseline: z.number().nullable().optional(), sample_rate_hz: z.number().nullable().optional(), calibration_mode: z.string().nullable().optional(), calibrated: z.boolean().nullable().optional() }),
     event_detected: z.boolean().nullable(), cuff_pressure_mmhg: z.number().nullable(), pressure_calibration_version: z.string().nullable(),
     heart_rate_bpm: z.number().nullable(), is_valid: z.boolean(), quality_flags: z.array(z.string()), firmware_version: z.string().nullable(),
     processing_algorithm_version: z.string().nullable(), data_provenance: z.string() })),
@@ -37,6 +48,8 @@ const AuthSchema = z.object({ access_token: z.string().min(1), token_type: z.lit
 const ApiErrorSchema = z.object({ error: z.object({ code: z.string(), message: z.string(), details: z.array(z.unknown()).optional() }) })
 
 export type Device = z.infer<typeof DeviceSchema>
+export type DeviceCommand = z.infer<typeof DeviceCommandSchema>
+export type MessagingHealth = z.infer<typeof MessagingHealthSchema>
 export type RemoteSession = z.infer<typeof SessionSchema>
 export type RemoteSample = z.infer<typeof SamplesSchema>['samples'][number]
 export type RemoteAcousticEvent = z.infer<typeof SamplesSchema>['acoustic_events'][number]
@@ -90,6 +103,7 @@ throw new ApiError(
     try { return schema.parse(await response.json()) } catch { throw new ApiError('The backend returned an invalid response.', 'response', response.status) }
   }
   async health() { return this.json('/health', HealthSchema) }
+  async messagingHealth() { return this.json('/health/messaging', MessagingHealthSchema) }
   async readiness() { return this.json('/ready', z.object({ status: z.string(), database: z.object({ status: z.string() }).optional() })) }
   async register(username: string, displayName: string, password: string) {
     return this.json('/api/v1/auth/register', AuthSchema, { method: 'POST', body: JSON.stringify({ username, display_name: displayName, password }) })
@@ -97,10 +111,22 @@ throw new ApiError(
   async login(username: string, password: string) {
     return this.json('/api/v1/auth/login', AuthSchema, { method: 'POST', body: JSON.stringify({ username, password }) })
   }
+  async logout() { await this.request('/api/v1/auth/logout', { method: 'POST' }) }
   async listDevices() { return this.json('/api/v1/devices', z.object({ items: z.array(DeviceSchema) })) }
   async getDevice(id: string) { return this.json(`/api/v1/devices/${encodeURIComponent(id)}`, DeviceSchema) }
   async registerDevice(deviceIdentifier: string, hardwareRevision?: string) {
     return this.json('/api/v1/devices', DeviceSchema, { method: 'POST', body: JSON.stringify({ device_identifier: deviceIdentifier, hardware_revision: hardwareRevision || null }) })
+  }
+  async enrollDeviceMqtt(deviceId: string, mqttPrincipal: string) {
+    return this.json(`/api/v1/devices/${encodeURIComponent(deviceId)}/mqtt-enrollment`, DeviceSchema, {
+      method: 'POST', body: JSON.stringify({ mqtt_principal: mqttPrincipal }),
+    })
+  }
+  async requestDeviceStatus(deviceId: string) {
+    return this.json(`/api/v1/devices/${encodeURIComponent(deviceId)}/status-request`, DeviceCommandSchema, { method: 'POST' })
+  }
+  async getDeviceCommand(deviceId: string, commandId: string) {
+    return this.json(`/api/v1/devices/${encodeURIComponent(deviceId)}/commands/${encodeURIComponent(commandId)}`, DeviceCommandSchema)
   }
   async createSession(deviceId: string, idempotencyKey: string) {
     return this.json('/api/v1/sessions', SessionSchema, { method: 'POST', body: JSON.stringify({ device_id: deviceId, idempotency_key: idempotencyKey }) })

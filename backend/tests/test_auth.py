@@ -5,7 +5,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.api.routes.auth import login, register
+from app.api.routes.auth import login, logout, refresh, register
 from app.models import Owner, OwnerCredential
 from app.schemas.auth import CredentialsRequest, RegistrationRequest
 from app.security.auth import get_current_owner_username
@@ -69,3 +69,17 @@ def test_expired_and_valid_credentials_are_handled(db_session) -> None:
         get_current_owner_username(HTTPAuthorizationCredentials(scheme="Bearer", credentials="expired-token"), db_session)
     assert expired_error.value.status_code == 401
     assert get_current_owner_username(HTTPAuthorizationCredentials(scheme="Bearer", credentials="valid-token"), db_session) == owner.username
+
+
+def test_refresh_rotates_token_and_logout_revokes_it(db_session) -> None:
+    auth = register(RegistrationRequest(username="rotate_user", display_name="Rotate", password="correct horse battery staple"), db_session)
+    old = HTTPAuthorizationCredentials(scheme="Bearer", credentials=auth.access_token)
+    rotated = refresh(old, db_session)
+    assert rotated.access_token != auth.access_token
+    with pytest.raises(HTTPException):
+        get_current_owner_username(old, db_session)
+    new = HTTPAuthorizationCredentials(scheme="Bearer", credentials=rotated.access_token)
+    assert get_current_owner_username(new, db_session) == "rotate_user"
+    logout(new, db_session)
+    with pytest.raises(HTTPException):
+        get_current_owner_username(new, db_session)

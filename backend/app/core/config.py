@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,12 +17,21 @@ class Settings(BaseSettings):
     max_telemetry_batch_samples: int = Field(default=500, ge=1, le=500)
     max_telemetry_batch_bytes: int = Field(default=262144, ge=1024, le=1048576)
     mqtt_enabled: bool = False
-    mqtt_host: str | None = None
-    mqtt_port: int = Field(default=8883, ge=1, le=65535)
-    mqtt_client_id: str = Field(default="bp-backend", min_length=1, max_length=128)
+    mqtt_legacy_topic_compatibility: bool = False
+    mqtt_host: str | None = Field(
+        default="k7128701.ala.asia-southeast1.emqxsl.com",
+        validation_alias=AliasChoices("MQTT_BROKER_HOST", "MQTT_HOST"),
+    )
+    mqtt_port: int = Field(default=8883, ge=1, le=65535, validation_alias=AliasChoices("MQTT_BROKER_PORT", "MQTT_PORT"))
+    mqtt_tls_enabled: bool = True
+    mqtt_client_id: str = Field(default="bp_backend_local", min_length=1, max_length=128)
+    mqtt_keepalive: int = Field(default=60, ge=10, le=300)
     mqtt_username: str | None = None
     mqtt_password: SecretStr | None = None
-    mqtt_ca_file: str | None = None
+    mqtt_ca_file: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("MQTT_CA_CERT_PATH", "MQTT_CA_FILE"),
+    )
     mqtt_client_cert_file: str | None = None
     mqtt_client_key_file: str | None = None
     mqtt_queue_size: int = Field(default=500, ge=1, le=5000)
@@ -34,7 +43,9 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def mqtt_requires_service_credentials(self) -> "Settings":
         if self.mqtt_enabled and not (self.mqtt_host and self.mqtt_username and self.mqtt_password):
-            raise ValueError("MQTT_ENABLED requires MQTT_HOST, MQTT_USERNAME, and MQTT_PASSWORD")
+            raise ValueError("MQTT_ENABLED requires MQTT_BROKER_HOST, MQTT_USERNAME, and MQTT_PASSWORD")
+        if self.mqtt_enabled and not self.mqtt_tls_enabled:
+            raise ValueError("MQTT must use TLS when enabled")
         if self.mqtt_enabled and not self.database_configured:
             raise ValueError("MQTT_ENABLED requires DATABASE_URL for device enrollment and telemetry persistence")
         if bool(self.mqtt_client_cert_file) != bool(self.mqtt_client_key_file):
@@ -50,6 +61,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        populate_by_name=True,
     )
 
     @property

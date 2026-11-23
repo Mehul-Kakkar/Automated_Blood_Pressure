@@ -58,6 +58,10 @@ class ProcessedSignalSample(BaseModel):
     envelope: Decimal | None
     noise_floor: Decimal | None
     threshold: Decimal | None
+    adc_baseline: Decimal | None = None
+    sample_rate_hz: int | None = None
+    calibration_mode: str | None = None
+    calibrated: bool | None = None
 
 
 class TelemetrySampleResponse(BaseModel):

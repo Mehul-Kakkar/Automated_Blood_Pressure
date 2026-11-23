@@ -1,6 +1,6 @@
 # Backend
 
-Foundational FastAPI service and PostgreSQL persistence layer for the experimental device project. The current ESP32 firmware does not send network telemetry or pressure readings; the telemetry schema and internal batch writer define a future, validated storage boundary, not an existing wire contract. This API makes no clinical claims.
+FastAPI service and PostgreSQL persistence layer for the experimental device project. The integrated ESP32-S3 firmware has an optional MQTT/TLS transport for status, commands, and telemetry when provisioned with device credentials and a broker. Direct phone BLE sessions remain separate from backend sessions. This API makes no clinical claims.
 
 ## Requirements
 
@@ -79,9 +79,9 @@ Alembic owns schema changes. The initial migration creates:
 - `acoustic_events`: independently identified detected events, optional device time, strength, optional mmHg pressure, validity/quality, versions, and provenance.
 - `reports`: report version, generator version, status, validation/sample watermark metadata, and safe failure code. Report content/generation is not implemented.
 
-The schema includes owners, revocable bearer credentials, device ownership, and owner-scoped session authorization. There is no public telemetry ingestion endpoint: the current firmware has no MQTT/Wi-Fi contract or device authentication. The internal `ingest_telemetry_batch` service accepts only the documented future schema, verifies the registered device/session association, enforces sample and serialized-byte caps, and atomically inserts batches/samples/events. Repeating the same batch ID with the same canonical content is a no-op; reusing it with different content or colliding record IDs raises a conflict. No raw payload is logged or retained as a blob.
+The schema includes owners, revocable bearer credentials, device ownership, and owner-scoped session authorization. MQTT ingestion is optional and disabled by default; it verifies the enrolled device principal and session association before storing telemetry through `ingest_telemetry_batch`, which enforces sample and serialized-byte caps and atomically inserts batches/samples/events. Repeating the same batch ID with the same canonical content is a no-op; reusing it with different content or colliding record IDs raises a conflict. No raw payload is logged or retained as a blob. BLE-local guest session migration into PostgreSQL has not been implemented.
 
-Current firmware output remains USB Serial diagnostics (`ms,raw,filtered,envelope,noise,threshold,event`) and has no pressure sensor values. Future protocol work must define and verify identifiers, sequences, units, timestamps, field bounds, device authentication, and provenance before the internal storage schema is exposed to a network transport.
+The firmware also retains the standalone USB Serial acoustic diagnostic sketch (`ms,raw,filtered,envelope,noise,threshold,event`). The integrated controller has pressure readings and optional BLE/MQTT messages; their calibration, waveform quality, and complete end-to-end operation still require hardware verification.
 
 ## Tests
 
@@ -123,7 +123,7 @@ The PostgreSQL-specific integration tests apply/check migrations and exercise ba
 
 The backend includes an optional MQTT 5 client using Paho. It is disabled by default. When enabled, it verifies the broker certificate and hostname, requires backend service credentials, uses QoS 1, bounded queues, manual acknowledgements, reconnect behavior, and non-retained command publishes with MQTT message expiry. Client certificates may also be configured. TLS verification cannot be disabled.
 
-No MQTT broker or cloud deployment is configured in this repository. To run this feature, provision a reachable broker with a TLS listener (normally 8883), a certificate whose SAN matches the broker hostname, a trusted CA, anonymous access disabled, a dedicated backend service identity, and an ACL file. Do not commit broker certificates, private keys, password files, or `.env` files. For a local broker such as Mosquitto, install it separately, generate a local development CA/server certificate, configure its TLS listener and password/ACL files, and create distinct backend and device credentials. Use a broker principal equal to the enrolled device UUID for each device. Broker ACLs, not payload claims alone, must restrict each device to its own topics. The backend verifies that the topic UUID, payload UUID, enrollment record, MQTT-enabled flag, and enrolled principal agree; standard MQTT message callbacks do not expose the broker-authenticated publisher identity to application code.
+EMQX Cloud endpoint settings are provided for local use in the root `.env.example`; the actual password and broker ACL changes remain operator-provisioned. Do not commit broker certificates, private keys, password files, or `.env` files. Broker ACLs, not payload claims alone, must restrict each device to its own topics. The backend verifies that the topic principal maps to the payload UUID, enrollment record, and MQTT-enabled flag; standard MQTT message callbacks do not expose the broker-authenticated publisher identity to application code.
 
 Configure `backend/.env` after copying `.env.example`:
 
@@ -147,14 +147,14 @@ These are backend-side proposed envelopes, not firmware contracts. The inspected
 
 | Topic | Publisher | Meaning |
 | --- | --- | --- |
-| `bp/v1/devices/{device_id}/telemetry` | Device | `{ "schema_version": "1", "payload": <validated telemetry batch> }` |
-| `bp/v1/devices/{device_id}/status` | Device | Versioned status with message UUID, device UUID, sequence, state, optional session/uptime/firmware/algorithm version, lost sample count and optional device timestamp |
-| `bp/v1/devices/{device_id}/commands` | Backend | Versioned command UUID, device UUID, optional session UUID, command type (`START`, `STOP`, `STATUS_REQUEST`), issue time and expiry |
-| `bp/v1/devices/{device_id}/responses` | Device | Versioned response UUID correlated by command UUID, device UUID, status (`accepted`, `rejected`, `completed`), optional state/reason/time |
+| `bp/devices/{mqtt_principal}/telemetry` | Device | `{ "schema_version": "1", "payload": <validated telemetry batch> }` |
+| `bp/devices/{mqtt_principal}/status` | Device | Versioned status with message UUID, backend device UUID, sequence, state, optional session/uptime/firmware/algorithm version, lost sample count and optional device timestamp |
+| `bp/devices/{mqtt_principal}/commands` | Backend | Versioned command UUID, backend device UUID, optional session UUID, command type (`START`, `STOP`, `STATUS_REQUEST`), issue time and expiry |
+| `bp/devices/{mqtt_principal}/ack` | Device | Versioned response UUID correlated by command UUID, backend device UUID, status (`accepted`, `rejected`, `completed`), optional state/reason/time |
 
 Use `+` ACL wildcards only for the backend service identity. Device principals should be constrained to write their own `telemetry`, `status`, and `responses` topics and read their own `commands` topic. The backend service identity needs read access to the three ingress topic families and write access to `commands` only. Deny all other topic access. A deployment using a broker with different ACL syntax must implement equivalent per-identity restrictions.
 
-The service subscribes only to telemetry, status, and response topics. Device identities must be trustedly enrolled in PostgreSQL with `mqtt_enabled=true` and `mqtt_principal` set to that device UUID. Owner-authenticated POST /api/v1/devices creates an MQTT-disabled record only; broker credentials and topic ACLs remain operator-provisioned. The Phase 5 session API uses revocable owner bearer credentials and checks device ownership. Command delivery is never retained or replayed after a disconnect, START commands expire, duplicate command IDs are rejected, and the device must independently enforce expiry, allowed state transitions, pressure limits, and safety interlocks. A broker publish acknowledgement only means broker delivery handling, not that a measurement started or stopped.
+The service subscribes only to telemetry, status, and ack topics. Devices must be enrolled in PostgreSQL with `mqtt_enabled=true` and `mqtt_principal` set to their broker topic key. Owner-authenticated device registration alone does not enroll MQTT; use the owner-scoped enrollment route after operator provisioning. Broker credentials and topic ACLs remain operator-provisioned. The Phase 5 session API uses revocable owner bearer credentials and checks device ownership. Command delivery is never retained or replayed after a disconnect, commands expire, duplicate command IDs are rejected, and the device must independently enforce expiry, allowed state transitions, pressure limits, and safety interlocks. A broker publish acknowledgement only means broker delivery handling, not that a measurement started or stopped.
 
 `GET /health/messaging` reports enabled/connected state, queue depth/capacity, timestamps, and aggregate counters without credentials or measurement payloads. Test transport behavior without a live broker using:
 
@@ -254,10 +254,22 @@ To install the pinned PDF dependency with the service: `python -m pip install -r
 
 ## Phase 7: frontend integration boundary
 
+## EMQX Cloud local integration
+
+The current backend and firmware share `bp/devices/{mqtt_principal}/{telemetry|status|commands|ack}`. Legacy `bp/v1/devices/{device_uuid}/{telemetry|status|commands|responses}` support is opt-in with `MQTT_LEGACY_TOPIC_COMPATIBILITY=true`; enable it only after the backend broker principal's EMQX ACL grants those legacy filters. The backend routes commands to the legacy namespace after it sees a device report there. JSON payload `device_id` remains the backend UUID, while the current topic segment is `Device.mqtt_principal` (the supplied device key is `bp_device_001`). Owner-scoped `POST /api/v1/devices/{device_id}/mqtt-enrollment` associates that key with an owned device. This API does not create EMQX credentials or ACL rules; configure them in EMQX Cloud.
+
+For local Compose, copy root `.env.example` to `.env`, set a strong local `POSTGRES_PASSWORD`, supply the real backend `MQTT_PASSWORD`, and set `MQTT_ENABLED=true` only after ACL setup. The broker defaults to `k7128701.ala.asia-southeast1.emqxsl.com:8883`; TLS verification is mandatory and the image installs system CA certificates. Optional `MQTT_CA_CERT_PATH` is a container path under `/run/mqtt-ca`, backed by the read-only `./certs` mount. Rebuild with `docker compose up -d --build backend`. Keep device credentials in ignored firmware `secrets.h`, never in backend/frontend configuration.
+
+Set firmware `BP_DEVICE_ID` to the registered backend UUID, and `BP_MQTT_DEVICE_KEY` plus MQTT username to the key enrolled in the app. Give the backend wildcard subscribe access to telemetry/status/ack and wildcard publish access to commands. Each device principal must be limited to its own telemetry/status/ack and commands topics. No broker ACL is provisioned by the API.
+
+`POST /api/v1/devices/{device_id}/status-request` sends a non-actuating status request; `GET /api/v1/devices/{device_id}/commands/{command_id}` reports acknowledgement state. Retained data/status/ack messages are rejected, and device online freshness expires after 30 seconds by default. The current PubSubClient firmware publishes at QoS 0, so a connection loss during publish can lose that message despite sequence/batch identifiers and backend deduplication. Commands use QoS 1, expiry, and explicit device acknowledgements.
+
+The repository does not contain the live broker password or broker CA PEM, so a live EMQX connection cannot be checked here. Keep MQTT disabled until the password is set locally and verify the broker ACLs independently.
+
 The companion frontend now calls the typed `/health`, `/ready`, `/api/v1/devices`, `/api/v1/sessions`, session sample/event, report, and PDF APIs with Zod response validation. Owner tokens remain in browser memory only. The API uses authenticated fetch-based SSE because native `EventSource` cannot attach the backend's bearer header. Frontend device status is derived only from a fresh backend device report; backend reachability and phone BLE are reported separately.
 
 `POST /api/v1/devices` creates an owner-scoped record with MQTT disabled. It is not trusted hardware enrollment and cannot make a device online or authorized for commands. The frontend Start path requires current device `online`/`idle`, sends an idempotent session create request, then waits for device-confirmed `measuring`; Stop waits for `completed` and remains uncertain on timeout/disconnect. Batch events retrieve bounded sample pages and the UI retains 120 points. No REST call is made for every raw sample. History is owner-scoped and paginated, reports can be generated/downloaded, and demo samples never reach backend methods.
 
 Device REST contract: `POST /api/v1/devices` accepts `{ "device_identifier": "...", "hardware_revision": "..." }` and creates an owner-bound, MQTT-disabled record. `GET /api/v1/devices` lists the caller-owned records; `GET /api/v1/devices/{device_id}` returns one caller-owned device or 404. The `online` flag requires MQTT enrollment and a state report newer than `DEVICE_STATE_MAX_AGE_SECONDS`. Registration does not provision a device credential or allow commands until trusted operator enrollment is completed.
 
-The actual ESP32 sketches still provide no compatible remote transport/session protocol, pressure, or heart rate. Therefore Phase 7 does not make real-device commands, live telemetry, or pressure displays operational. A TLS broker, trusted device provisioning, protocol-compatible firmware, real calibration, and physical safety verification remain required. Frontend token entry is a local prototype affordance, not a production identity provider; production needs secure account authentication and HTTPS.
+The `finalESP` sketch now implements the versioned MQTT telemetry, status, command, and acknowledgement envelopes used by this API. The separate `korotkoffDebug` sketch remains a USB Serial diagnostic and does not emit these messages. Real broker credentials, device ACL provisioning, physical pressure calibration, and end-to-end hardware safety verification remain required; this integration does not make pressure estimates clinically valid. Frontend account authentication is a local prototype and production still requires HTTPS and appropriate identity operations.

@@ -140,6 +140,10 @@ def ingest_telemetry_batch(
                                 "batch_id": str(payload.batch_id),
                                 "received_at": now.isoformat(),
                                 "pressure_calibration_version": pressure_calibration_version,
+                                "adc_baseline": str(item.adc_baseline) if item.adc_baseline is not None else None,
+                                "sample_rate_hz": item.sample_rate_hz,
+                                "calibration_mode": item.calibration_mode,
+                                "acoustic_calibrated": item.calibrated,
                             },
                         )
                         for item in payload.samples
