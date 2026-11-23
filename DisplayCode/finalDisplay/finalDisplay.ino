@@ -67,12 +67,16 @@ uint8_t mainPeerMac[6] = {0};
 bool mainPeerLearned = false;
 uint32_t lastHeartbeat = 0;
 uint32_t lastMainAt = 0;
+uint32_t lastChannelScan = 0;
+uint8_t scanChannel = ESPNOW_CHANNEL;
 bool mainSeen = false;
 bool staleReported = false;
 volatile bool pendingUiUpdate = false;
 char pendingStatus[48] = "WAITING FOR CONTROLLER";
 char pendingMessage[100] = "";
 char pendingPressure[24] = "--";
+char pendingSystolic[16] = "--";
+char pendingDiastolic[16] = "--";
 }
 
 static lv_obj_t *connectionLabel = nullptr;
@@ -80,6 +84,8 @@ static lv_obj_t *controllerStateLabel = nullptr;
 static lv_obj_t *startButtonLabel = nullptr;
 static lv_obj_t *stopButtonLabel = nullptr;
 static lv_obj_t *cuffPressureLabel = nullptr;
+static lv_obj_t *systolicLabel = nullptr;
+static lv_obj_t *diastolicLabel = nullptr;
 
 static String makeRequestId() {
   uint32_t a = esp_random(), b = esp_random(), c = esp_random(), d = esp_random();
@@ -175,11 +181,21 @@ static void onEspNowReceive(const esp_now_recv_info_t *info,
   staleReported = false;
 
   if (strcmp(packet.type, "MAIN_STATUS") == 0) {
-    StaticJsonDocument<192> document;
+    StaticJsonDocument<224> document;
     if (deserializeJson(document, packet.payload) == DeserializationError::Ok) {
       const char *state = document["state"] | "unknown";
       const char *fault = document["fault"] | "none";
       strlcpy(pendingStatus, state, sizeof(pendingStatus));
+      const bool bpValid = document["bp_valid"] == true;
+      const bool bpDemo = document["bp_demo"] == true;
+      if ((bpValid || bpDemo) && document["sys"].is<int>() && document["dia"].is<int>()) {
+        snprintf(pendingSystolic, sizeof(pendingSystolic), "%.0f", document["sys"].as<float>());
+        snprintf(pendingDiastolic, sizeof(pendingDiastolic), "%.0f", document["dia"].as<float>());
+        if (bpValid) strlcpy(pendingMessage, "EXPERIMENTAL BP ESTIMATE · NOT CLINICALLY VALIDATED", sizeof(pendingMessage));
+      } else {
+        strlcpy(pendingSystolic, "--", sizeof(pendingSystolic));
+        strlcpy(pendingDiastolic, "--", sizeof(pendingDiastolic));
+      }
       if (document["pressure_mmhg"].is<float>() || document["pressure_mmhg"].is<double>()) {
         snprintf(pendingPressure, sizeof(pendingPressure), "%.1f", document["pressure_mmhg"].as<float>());
         snprintf(pendingMessage, sizeof(pendingMessage), "%.1f mmHg | %s%s%s", document["pressure_mmhg"].as<float>(), state, strcmp(fault,"none") ? " | " : "", strcmp(fault,"none") ? fault : "");
@@ -187,6 +203,7 @@ static void onEspNowReceive(const esp_now_recv_info_t *info,
         strlcpy(pendingPressure, "--", sizeof(pendingPressure));
         snprintf(pendingMessage, sizeof(pendingMessage), "%s%s%s", state, strcmp(fault,"none") ? " | " : "", strcmp(fault,"none") ? fault : "");
       }
+      if (bpValid) strlcpy(pendingMessage, "BP ESTIMATE ONLY · NOT CLINICAL", sizeof(pendingMessage));
       pendingUiUpdate = true;
       Serial.printf("Controller state=%s uptime_ms=%lu pressure_raw=%ld\n",
                     state, (unsigned long)(document["uptime_ms"] | 0UL),
@@ -228,7 +245,9 @@ static bool initializeEspNow() {
   esp_now_register_recv_cb(onEspNowReceive);
   esp_now_peer_info_t peer{};
   memcpy(peer.peer_addr, BROADCAST_MAC, 6);
-  peer.channel = ESPNOW_CHANNEL;
+  // Channel 0 means use this radio's current channel. The display scans for
+  // the controller, which may follow its configured Wi-Fi AP channel.
+  peer.channel = 0;
   peer.ifidx = WIFI_IF_STA;
   peer.encrypt = false;
   if (esp_now_add_peer(&peer) != ESP_OK) {
@@ -237,6 +256,7 @@ static bool initializeEspNow() {
   }
   sendPacket("PING", "{\"source\":\"display\",\"protocol_version\":1}");
   lastHeartbeat = millis();
+  lastChannelScan = lastHeartbeat;
   return true;
 }
 
@@ -247,12 +267,23 @@ static void processTransportUi() {
     if (connectionLabel) lv_label_set_text(connectionLabel, pendingMessage);
     if (controllerStateLabel) lv_label_set_text(controllerStateLabel, pendingStatus);
     if (cuffPressureLabel) lv_label_set_text(cuffPressureLabel, pendingPressure);
+    if (systolicLabel) lv_label_set_text(systolicLabel, pendingSystolic);
+    if (diastolicLabel) lv_label_set_text(diastolicLabel, pendingDiastolic);
   }
   if (mainSeen && !staleReported && (uint32_t)(millis() - lastMainAt) > 5000) {
     staleReported = true;
     strlcpy(pendingMessage, "CONTROLLER STATUS UNCERTAIN", sizeof(pendingMessage));
     pendingUiUpdate = true;
     Serial.println("CONTROLLER STATUS UNCERTAIN: heartbeat/status timeout");
+  }
+  const bool linkUnavailable = !mainSeen || staleReported;
+  if (linkUnavailable && (uint32_t)(millis() - lastChannelScan) >= 250) {
+    lastChannelScan = millis();
+    scanChannel = scanChannel >= 13 ? 1 : scanChannel + 1;
+    const esp_err_t channelResult = esp_wifi_set_channel(scanChannel, WIFI_SECOND_CHAN_NONE);
+    if (channelResult == ESP_OK) {
+      sendPacket("PING", "{\"source\":\"display\",\"protocol_version\":1}");
+    }
   }
   if ((uint32_t)(millis() - lastHeartbeat) >= HEARTBEAT_MS) {
     lastHeartbeat = millis();
@@ -365,12 +396,13 @@ static void buildStartScreen() {
 }
 
 static lv_obj_t *makeMetricPanel(lv_obj_t *parent, const char *titleText,
-                                 int x, const lv_font_t *valueFont) {
+                                 int x, const lv_font_t *valueFont, lv_obj_t **valueOut) {
   lv_obj_t *panel = makePanel(parent, 100, 134, x, 38);
   lv_obj_t *title = makeLabel(panel, titleText, 0x0284C7);
   lv_obj_align(title, LV_ALIGN_TOP_LEFT, 4, 2);
   lv_obj_t *value = makeLabel(panel, "--", 0x0F172A, valueFont);
   lv_obj_align(value, LV_ALIGN_CENTER, 0, 10);
+  if (valueOut) *valueOut = value;
   return panel;
 }
 
@@ -396,8 +428,8 @@ static void buildDashboard() {
   controllerStateLabel = makeLabel(badge, "OFFLINE", 0xFFFFFF);
   lv_obj_center(controllerStateLabel);
 
-  makeMetricPanel(screenDashboard, "SYS mmHg", 6, &lv_font_montserrat_48);
-  makeMetricPanel(screenDashboard, "DIA mmHg", 110, &lv_font_montserrat_48);
+  makeMetricPanel(screenDashboard, "SYS mmHg", 6, &lv_font_montserrat_48, &systolicLabel);
+  makeMetricPanel(screenDashboard, "DIA mmHg", 110, &lv_font_montserrat_48, &diastolicLabel);
 
   lv_obj_t *mapPanel = makePanel(screenDashboard, 94, 64, 214, 38);
   lv_obj_t *mapTitle = makeLabel(mapPanel, "CUFF mmHg", 0x64748B);
